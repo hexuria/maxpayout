@@ -1,0 +1,12 @@
+[submodule "flushline"]
+	path = flushline
+	url = git@hexuria.github.com:hexuria/flushline.git
+[submodule "matrix"]
+	path = matrix
+	url = git@hexuria.github.com:hexuria/matrix.git
+[submodule "potbonus"]
+	path = potbonus
+	url = git@hexuria.github.com:hexuria/potbonus.git
+[submodule "sponsor_allocator"]
+	path = sponsor_allocator
+	url = git@hexuria.github.com:hexuria/sponsor-allocator.git
