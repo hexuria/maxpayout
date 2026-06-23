@@ -1,0 +1,21 @@
+[package]
+name = "coordinator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-native-tls", "uuid", "chrono"] }
+tokio = { version = "1.0", features = ["full"] }
+thiserror = "2.0"
+uuid = { version = "1.0", features = ["v7", "serde"] }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Sibling crates
+flushline = { path = "../flushline", features = ["db"] }
+matrix = { path = "../matrix", features = ["db"] }
+sponsor_allocator = { path = "../sponsor_allocator", features = ["db"] }
+potbonus = { path = "../potbonus", features = ["db"] }
+
+[dev-dependencies]
+serde_json = "1.0"
