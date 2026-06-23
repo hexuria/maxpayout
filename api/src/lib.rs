@@ -1,4 +1,6 @@
+pub mod auth;
 pub mod handlers;
+pub mod middleware;
 
 use sqlx::PgPool;
 
@@ -11,6 +13,7 @@ pub async fn run_migrations(pool: &PgPool) {
             "../../sponsor_allocator/migrations/20260623000000_create_sponsor_allocator_tables.sql"
         ),
         include_str!("../../coordinator/migrations/20260624000000_create_coordination_tables.sql"),
+        include_str!("../migrations/20260625000000_create_auth_tables.sql"),
     ];
 
     tracing::info!("Running database migrations...");

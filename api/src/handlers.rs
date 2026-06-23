@@ -4,6 +4,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use axum_extra::extract::cookie::{Cookie, CookieJar};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
@@ -16,6 +17,8 @@ use coordinator::PgAccountAggregator;
 pub struct AppState {
     pub pool: PgPool,
     pub aggregator: Arc<PgAccountAggregator>,
+    pub rate_limiter: Arc<crate::middleware::IpRateLimiter>,
+    pub webauthn: Arc<webauthn_rs::prelude::Webauthn>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +56,7 @@ pub struct SignupRequest {
     pub username: String,
     pub user_id: Option<Uuid>,
     pub account_id: Option<Uuid>,
+    pub sponsor_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -64,10 +68,18 @@ pub struct SignupResponse {
 
 pub async fn signup_user(
     State(state): State<AppState>,
+    cookie_jar: CookieJar,
     Json(payload): Json<SignupRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = payload.user_id.unwrap_or_else(Uuid::now_v7);
     let account_id = payload.account_id.unwrap_or_else(Uuid::now_v7);
+
+    // Resolve sponsor from body payload or cookies
+    let sponsor_uuid = payload.sponsor_id.or_else(|| {
+        cookie_jar
+            .get("sponsor_id")
+            .and_then(|c| Uuid::parse_str(c.value()).ok())
+    });
 
     let mut tx = state.pool.begin().await?;
 
@@ -88,7 +100,54 @@ pub async fn signup_user(
     .execute(&mut *tx)
     .await?;
 
-    // 3. Initialize matrix tree for the user
+    // 3. Initialize matrix tree placement (join sponsor if specified, otherwise create new matrix)
+    if let Some(sp_id) = sponsor_uuid {
+        let sponsor_acct = matrix::AccountId::from(sp_id);
+        if let Some(mut sponsor_matrix) = state
+            .aggregator
+            .matrix_repo
+            .find_active_by_owner_tx(&mut tx, sponsor_acct)
+            .await
+            .map_err(|e| ApiError::Matrix(e.to_string()))?
+        {
+            let new_matrix_account = matrix::Account::sponsored(
+                matrix::AccountId::from(account_id),
+                sponsor_acct,
+                &payload.username,
+            );
+            sponsor_matrix
+                .add_account(new_matrix_account)
+                .map_err(|e| ApiError::Matrix(e.to_string()))?;
+
+            if sponsor_matrix.is_full() {
+                let (new_m, _graduates, cycle_events) = sponsor_matrix
+                    .cycle()
+                    .map_err(|e| ApiError::Matrix(e.to_string()))?;
+
+                state
+                    .aggregator
+                    .matrix_repo
+                    .save_tx(&mut tx, &sponsor_matrix, &[])
+                    .await
+                    .map_err(|e| ApiError::Matrix(e.to_string()))?;
+                state
+                    .aggregator
+                    .matrix_repo
+                    .save_tx(&mut tx, &new_m, &cycle_events)
+                    .await
+                    .map_err(|e| ApiError::Matrix(e.to_string()))?;
+            } else {
+                state
+                    .aggregator
+                    .matrix_repo
+                    .save_tx(&mut tx, &sponsor_matrix, &[])
+                    .await
+                    .map_err(|e| ApiError::Matrix(e.to_string()))?;
+            }
+        }
+    }
+
+    // Initialize personal matrix tree for the user
     let matrix_id = Uuid::now_v7();
     sqlx::query("INSERT INTO matrices (id, owner_id, status) VALUES ($1, $2, 'Filling')")
         .bind(matrix_id)
@@ -112,6 +171,34 @@ pub async fn signup_user(
             username: payload.username,
         }),
     ))
+}
+
+// ----------------------------------------------------------------------------
+// GET /ref/:sponsor_id
+// ----------------------------------------------------------------------------
+
+pub async fn set_referral_cookie(
+    cookie_jar: CookieJar,
+    Path(sponsor_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let cookie = Cookie::build(("sponsor_id", sponsor_id.to_string()))
+        .path("/")
+        .http_only(true)
+        .same_site(axum_extra::extract::cookie::SameSite::Lax)
+        .max_age(time::Duration::days(30))
+        .build();
+
+    let updated_jar = cookie_jar.add(cookie);
+    (
+        updated_jar,
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "Referral sponsor cookie set successfully",
+                "sponsor_id": sponsor_id
+            })),
+        ),
+    )
 }
 
 // ----------------------------------------------------------------------------

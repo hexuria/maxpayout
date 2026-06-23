@@ -28,6 +28,11 @@ async fn setup_test_db() -> PgPool {
 
     // Clean drop of all tables in dependency order
     let drop_statements = [
+        "DROP TABLE IF EXISTS auth_sessions CASCADE",
+        "DROP TABLE IF EXISTS auth_passkeys CASCADE",
+        "DROP TABLE IF EXISTS auth_webauthn_challenges CASCADE",
+        "DROP TABLE IF EXISTS auth_magic_links CASCADE",
+        "DROP TABLE IF EXISTS auth_users CASCADE",
         "DROP TABLE IF EXISTS orchestrator_inbox_log CASCADE",
         "DROP TABLE IF EXISTS orchestrator_coordination_states CASCADE",
         "DROP TABLE IF EXISTS flushline_outbox CASCADE",
@@ -99,9 +104,20 @@ async fn test_api_full_flow() {
 
     // Setup app state and routing
     let aggregator = Arc::new(coordinator::PgAccountAggregator::new(pool.clone()));
+    let rp_id = "localhost";
+    let rp_origin = webauthn_rs::prelude::Url::parse("http://localhost:8080").unwrap();
+    let webauthn = Arc::new(
+        webauthn_rs::prelude::WebauthnBuilder::new(rp_id, &rp_origin)
+            .unwrap()
+            .build()
+            .unwrap(),
+    );
+    let rate_limiter = Arc::new(api::middleware::IpRateLimiter::new(100, 200)); // higher limits for tests
     let state = AppState {
         pool: pool.clone(),
         aggregator: aggregator.clone(),
+        rate_limiter,
+        webauthn,
     };
 
     let app = Router::new()
