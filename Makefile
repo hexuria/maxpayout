@@ -1,7 +1,7 @@
 # MaxPayout Suite Makefile
 
 # List of crates in the workspace
-CRATES := flushline matrix sponsor_allocator potbonus
+CRATES := flushline matrix sponsor_allocator potbonus coordinator api
 
 .PHONY: all check clippy fmt test help $(CRATES)
 
@@ -31,7 +31,11 @@ check:
 	@for crate in $(TARGET_CRATES); do \
 		if [ -d "$$crate" ]; then \
 			echo "=== Checking compilation for: $$crate ==="; \
-			(cd $$crate && cargo check --all-targets && cargo check --target wasm32-unknown-unknown && cargo check --target wasm32-wasip1) || exit 1; \
+			(cd $$crate && cargo check --all-targets) || exit 1; \
+			if [ "$$crate" = "flushline" ] || [ "$$crate" = "matrix" ] || [ "$$crate" = "sponsor_allocator" ] || [ "$$crate" = "potbonus" ]; then \
+				echo "--- Checking WASM targets for: $$crate ---"; \
+				(cd $$crate && cargo check --target wasm32-unknown-unknown && cargo check --target wasm32-wasip1) || exit 1; \
+			fi; \
 		else \
 			echo "Error: Crate '$$crate' does not exist. Available crates: $(CRATES)"; \
 			exit 1; \
