@@ -20,6 +20,9 @@ governor = "0.6"
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 time = "0.3"
+bcrypt = "0.15"
+reqwest = { version = "0.11", features = ["json"] }
+
 
 # Sibling crates
 coordinator = { path = "../coordinator" }

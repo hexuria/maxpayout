@@ -26,6 +26,19 @@ pub struct MagicLinkRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct PasswordRegisterRequest {
+    pub email: String,
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasswordLoginRequest {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct MagicLinkLoginQuery {
     pub token: String,
 }
@@ -92,16 +105,78 @@ pub async fn request_magic_link(
         .execute(&state.pool)
         .await?;
 
-    // Mock Email Delivery: Log validation URL to tracing/console
     let magic_url = format!(
         "http://localhost:8080/api/auth/magic-link/login?token={}",
         token
     );
-    tracing::info!(
-        "MOCK EMAIL -> Magic Link requested for {}. URL: {}",
-        email,
-        magic_url
-    );
+
+    // Check if RESEND_API_KEY is configured
+    if let Ok(api_key) = std::env::var("RESEND_API_KEY") {
+        if !api_key.trim().is_empty() {
+            let sender = std::env::var("RESEND_SENDER")
+                .unwrap_or_else(|_| "onboarding@resend.dev".to_string());
+
+            let client = reqwest::Client::new();
+            let response = client
+                .post("https://api.resend.com/emails")
+                .header("Authorization", format!("Bearer {}", api_key))
+                .json(&serde_json::json!({
+                    "from": sender,
+                    "to": [email],
+                    "subject": "Log in to MaxPayout",
+                    "html": format!(
+                        "<p>Click the link below to log in to your MaxPayout account:</p><p><a href=\"{}\">Log In Now</a></p>",
+                        magic_url
+                    )
+                }))
+                .send()
+                .await;
+
+            match response {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        tracing::info!(
+                            "Successfully sent magic link email to {} via Resend",
+                            email
+                        );
+                    } else {
+                        let status = resp.status();
+                        let error_text = resp.text().await.unwrap_or_default();
+                        tracing::error!(
+                            "Failed to send email via Resend (Status: {}): {}",
+                            status,
+                            error_text
+                        );
+                        return Err(ApiError::Flushline(format!(
+                            "Failed to send email: {}",
+                            error_text
+                        )));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Error connecting to Resend API: {}", e);
+                    return Err(ApiError::Flushline(format!(
+                        "Failed to connect to email service: {}",
+                        e
+                    )));
+                }
+            }
+        } else {
+            // Fallback: log the URL if key is empty
+            tracing::info!(
+                "MOCK EMAIL -> Magic Link requested for {}. URL: {}",
+                email,
+                magic_url
+            );
+        }
+    } else {
+        // Fallback: log the URL if key is not set
+        tracing::info!(
+            "MOCK EMAIL -> Magic Link requested for {}. URL: {}",
+            email,
+            magic_url
+        );
+    }
 
     Ok((
         StatusCode::OK,
@@ -209,6 +284,150 @@ pub async fn login_via_magic_link(
     let updated_jar = cookie_jar.add(cookie);
 
     Ok((updated_jar, Json(user)))
+}
+
+// ----------------------------------------------------------------------------
+// Password Authentication Handlers
+// ----------------------------------------------------------------------------
+
+pub async fn register_password_user(
+    State(state): State<AppState>,
+    Json(payload): Json<PasswordRegisterRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let email = payload.email.trim().to_lowercase();
+    let username = payload.username.trim();
+    let password = payload.password;
+
+    if email.is_empty() {
+        return Err(ApiError::Flushline("Email cannot be empty".to_string()));
+    }
+    if username.is_empty() {
+        return Err(ApiError::Flushline("Username cannot be empty".to_string()));
+    }
+    if password.len() < 8 {
+        return Err(ApiError::Flushline(
+            "Password must be at least 8 characters".to_string(),
+        ));
+    }
+
+    // Check if email already exists
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM auth_users WHERE email = $1)")
+            .bind(&email)
+            .fetch_one(&state.pool)
+            .await?;
+
+    if exists {
+        return Err(ApiError::Flushline(
+            "User with this email already exists".to_string(),
+        ));
+    }
+
+    // Hash password safely using bcrypt
+    let password_hash = bcrypt::hash(&password, bcrypt::DEFAULT_COST)
+        .map_err(|e| ApiError::Flushline(format!("Hashing error: {e}")))?;
+
+    // Insert user
+    let user_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO auth_users (id, email, username, role, password_hash) VALUES ($1, $2, $3, 'user', $4)",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .bind(username)
+    .bind(&password_hash)
+    .execute(&state.pool)
+    .await?;
+
+    let auth_user = AuthUser {
+        id: user_id,
+        email,
+        username: username.to_string(),
+        role: "user".to_string(),
+    };
+
+    Ok((StatusCode::CREATED, Json(auth_user)))
+}
+
+pub async fn login_password_user(
+    State(state): State<AppState>,
+    cookie_jar: CookieJar,
+    Json(payload): Json<PasswordLoginRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let email = payload.email.trim().to_lowercase();
+    let password = payload.password;
+
+    // Fetch user with password_hash
+    let row =
+        sqlx::query("SELECT id, username, role, password_hash FROM auth_users WHERE email = $1")
+            .bind(&email)
+            .fetch_optional(&state.pool)
+            .await?;
+
+    let (user_id, username, role, stored_hash) = match row {
+        Some(r) => {
+            let user_id: Uuid = r.get("id");
+            let username: String = r.get("username");
+            let role: String = r.get("role");
+            let password_hash: Option<String> = r.get("password_hash");
+            (user_id, username, role, password_hash)
+        }
+        None => return Err(ApiError::Flushline("Invalid email or password".to_string())),
+    };
+
+    let hash_str = match stored_hash {
+        Some(h) => h,
+        None => {
+            return Err(ApiError::Flushline(
+                "This account does not have a password configured".to_string(),
+            ))
+        }
+    };
+
+    // Verify bcrypt hash
+    let valid = bcrypt::verify(&password, &hash_str)
+        .map_err(|e| ApiError::Flushline(format!("Verification error: {e}")))?;
+
+    if !valid {
+        return Err(ApiError::Flushline("Invalid email or password".to_string()));
+    }
+
+    let auth_user = AuthUser {
+        id: user_id,
+        email,
+        username,
+        role,
+    };
+
+    // Create session
+    let session_token: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(64)
+        .map(char::from)
+        .collect();
+
+    let session_expires = Utc::now() + chrono::Duration::days(7);
+
+    sqlx::query(
+        "INSERT INTO auth_sessions (user_id, session_token, expires_at) VALUES ($1, $2, $3)",
+    )
+    .bind(auth_user.id)
+    .bind(&session_token)
+    .bind(session_expires)
+    .execute(&state.pool)
+    .await?;
+
+    // Build session cookie
+    let cookie = Cookie::build(("session_token", session_token))
+        .path("/")
+        .http_only(true)
+        .same_site(axum_extra::extract::cookie::SameSite::Lax)
+        .max_age(time::Duration::days(7))
+        .build();
+
+    let updated_jar = cookie_jar.add(cookie);
+
+    Ok((updated_jar, Json(auth_user)))
 }
 
 // ----------------------------------------------------------------------------

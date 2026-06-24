@@ -14,6 +14,7 @@ pub async fn run_migrations(pool: &PgPool) {
         ),
         include_str!("../../coordinator/migrations/20260624000000_create_coordination_tables.sql"),
         include_str!("../migrations/20260625000000_create_auth_tables.sql"),
+        include_str!("../migrations/20260625000001_add_password_hash.sql"),
     ];
 
     tracing::info!("Running database migrations...");

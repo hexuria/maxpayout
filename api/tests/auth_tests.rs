@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use api::{
     auth::{
-        list_active_sessions, login_via_magic_link, request_magic_link, revoke_other_sessions,
-        revoke_session,
+        list_active_sessions, login_password_user, login_via_magic_link, register_password_user,
+        request_magic_link, revoke_other_sessions, revoke_session,
     },
     handlers::{set_referral_cookie, AppState},
     middleware::{auth_middleware, IpRateLimiter},
@@ -245,4 +245,192 @@ async fn test_auth_and_referral_flow() {
         .unwrap();
 
     assert_eq!(sessions_after_revoke.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_password_auth_flow() {
+    let _lock = DB_LOCK.lock().await;
+    let pool = setup_test_db().await;
+
+    let aggregator = Arc::new(coordinator::PgAccountAggregator::new(pool.clone()));
+    let rp_id = "localhost";
+    let rp_origin = webauthn_rs::prelude::Url::parse("http://localhost:8080").unwrap();
+    let webauthn = Arc::new(
+        webauthn_rs::prelude::WebauthnBuilder::new(rp_id, &rp_origin)
+            .unwrap()
+            .build()
+            .unwrap(),
+    );
+    let rate_limiter = Arc::new(IpRateLimiter::new(100, 200));
+
+    let state = AppState {
+        pool: pool.clone(),
+        aggregator,
+        rate_limiter,
+        webauthn,
+    };
+
+    let auth_routes = Router::new()
+        .route(
+            "/password/register",
+            axum::routing::post(register_password_user),
+        )
+        .route("/password/login", axum::routing::post(login_password_user));
+
+    let secure_auth_routes = Router::new()
+        .route("/sessions", axum::routing::get(list_active_sessions))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    let app = Router::new()
+        .nest("/api/auth", auth_routes)
+        .nest("/api/auth", secure_auth_routes)
+        .with_state(state);
+
+    // 1. Test registration with invalid fields
+    let bad_payloads = vec![
+        serde_json::json!({ "email": "", "username": "validuser", "password": "password123" }),
+        serde_json::json!({ "email": "valid@example.com", "username": "", "password": "password123" }),
+        serde_json::json!({ "email": "valid@example.com", "username": "validuser", "password": "123" }),
+    ];
+
+    for payload in bad_payloads {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/password/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // 2. Successful Registration
+    let register_payload = serde_json::json!({
+        "email": "user@example.com",
+        "username": "UserPass",
+        "password": "securepassword123"
+    });
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/password/register")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&register_payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body_str = get_response_body(resp.into_body()).await;
+    let body_json: Value = serde_json::from_str(&body_str).unwrap();
+    assert_eq!(
+        body_json.get("email").unwrap().as_str().unwrap(),
+        "user@example.com"
+    );
+    assert_eq!(
+        body_json.get("username").unwrap().as_str().unwrap(),
+        "UserPass"
+    );
+    assert!(body_json.get("id").is_some());
+
+    // 3. Prevent duplicate registration
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/password/register")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&register_payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 4. Login with incorrect password
+    let bad_login_payload = serde_json::json!({
+        "email": "user@example.com",
+        "password": "wrongpassword"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/password/login")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&bad_login_payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 5. Successful login
+    let login_payload = serde_json::json!({
+        "email": "user@example.com",
+        "password": "securepassword123"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/password/login")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&login_payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let login_headers = resp.headers();
+    let session_cookie = login_headers
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(session_cookie.contains("session_token="));
+
+    // Extract session token
+    let cookie_val = session_cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .split('=')
+        .nth(1)
+        .unwrap();
+
+    // 6. Access secure endpoint using the cookie
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/sessions")
+                .header("Cookie", format!("session_token={}", cookie_val))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sessions_body = get_response_body(resp.into_body()).await;
+    let sessions_json: Value = serde_json::from_str(&sessions_body).unwrap();
+    let sessions_arr = sessions_json.as_array().unwrap();
+    assert_eq!(sessions_arr.len(), 1);
 }

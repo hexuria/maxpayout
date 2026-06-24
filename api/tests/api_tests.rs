@@ -198,6 +198,7 @@ async fn test_api_full_flow() {
     let daemon_handle = tokio::spawn(coordinator::worker::start_orchestrator_daemon(
         daemon_aggregator,
         daemon_pool,
+        100,
     ));
 
     // 5. Award Progression Points (award 15 points to trigger graduation)

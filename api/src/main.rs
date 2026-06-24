@@ -11,9 +11,9 @@ use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use api::auth::{
-    list_active_sessions, login_passkey_finish, login_passkey_start, login_via_magic_link,
-    register_passkey_finish, register_passkey_start, request_magic_link, revoke_other_sessions,
-    revoke_session,
+    list_active_sessions, login_passkey_finish, login_passkey_start, login_password_user,
+    login_via_magic_link, register_passkey_finish, register_passkey_start, register_password_user,
+    request_magic_link, revoke_other_sessions, revoke_session,
 };
 use api::middleware::{auth_middleware, rate_limiter_middleware, IpRateLimiter};
 use api::{
@@ -63,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let daemon_handle = tokio::spawn(coordinator::worker::start_orchestrator_daemon(
         daemon_aggregator,
         daemon_pool,
+        1000,
     ));
 
     // WebAuthn Setup (Relying Party ID and Origin)
@@ -91,6 +92,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/magic-link/login", get(login_via_magic_link))
         .route("/passkey/login/start", post(login_passkey_start))
         .route("/passkey/login/finish", post(login_passkey_finish))
+        .route("/password/register", post(register_password_user))
+        .route("/password/login", post(login_password_user))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             rate_limiter_middleware,
