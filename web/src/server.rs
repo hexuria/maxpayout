@@ -5,9 +5,9 @@ use wasip3::http::types::{ErrorCode, Request, Response};
 
 use crate::app::{
     App, AwardPoints, GetActiveSessions, GetUserDashboardStatus, LoginPasskeyFinish,
-    LoginPasskeyStart, LoginViaMagicLink, Logout, RegisterPasskeyFinish,
-    RegisterPasskeyFinishSignup, RegisterPasskeyStart, RequestMagicLink, RevokeOtherSessions,
-    RevokeSession, SetReferralCookieSsr, shell,
+    LoginPasskeyStart, LoginViaMagicLink, LoginWithPassword, Logout, RegisterPasskeyFinish,
+    RegisterPasskeyFinishSignup, RegisterPasskeyStart, RegisterWithPassword, RequestMagicLink,
+    RevokeOtherSessions, RevokeSession, SetReferralCookieSsr, shell,
 };
 
 struct LeptosServer;
@@ -33,6 +33,8 @@ impl wasip3::exports::http::handler::Guest for LeptosServer {
             .static_files_handler("/pkg", serve_static_files)
             .with_server_fn_axum::<RequestMagicLink>()
             .with_server_fn_axum::<LoginViaMagicLink>()
+            .with_server_fn_axum::<LoginWithPassword>()
+            .with_server_fn_axum::<RegisterWithPassword>()
             .with_server_fn_axum::<SetReferralCookieSsr>()
             .with_server_fn_axum::<Logout>()
             .with_server_fn_axum::<GetUserDashboardStatus>()
