@@ -1984,6 +1984,19 @@ pub fn App() -> impl IntoView {
     }
 }
 
+fn clean_server_error<T: std::fmt::Display>(err: ServerFnError<T>) -> String {
+    match err {
+        ServerFnError::ServerError(msg) => msg.to_string(),
+        ServerFnError::Deserialization(msg) => format!("Failed to parse response: {}", msg),
+        ServerFnError::Serialization(msg) => format!("Failed to serialize arguments: {}", msg),
+        ServerFnError::Request(msg) => format!("Request failed: {}", msg),
+        ServerFnError::Response(msg) => format!("Server responded with error: {}", msg),
+        ServerFnError::Args(msg) => format!("Invalid arguments: {}", msg),
+        ServerFnError::MissingArg(msg) => format!("Missing argument: {}", msg),
+        other => other.to_string(),
+    }
+}
+
 #[component]
 fn HomePage() -> impl IntoView {
     let (show_register, set_show_register) = signal(false);
@@ -2156,7 +2169,7 @@ fn HomePage() -> impl IntoView {
                                         refresh_dashboard();
                                     }
                                     Err(e) => {
-                                        set_biometric_error.set(Some(e.to_string()));
+                                        set_biometric_error.set(Some(clean_server_error(e)));
                                         set_biometric_loading.set(false);
                                     }
                                 }
@@ -2177,7 +2190,7 @@ fn HomePage() -> impl IntoView {
                     }
                 }
                 Err(e) => {
-                    set_biometric_error.set(Some(e.to_string()));
+                    set_biometric_error.set(Some(clean_server_error(e)));
                     set_biometric_loading.set(false);
                 }
             }
@@ -2215,7 +2228,7 @@ fn HomePage() -> impl IntoView {
                                             refresh_dashboard();
                                         }
                                         Err(e) => {
-                                            check_error(e.to_string());
+                                            check_error(clean_server_error(e));
                                             set_biometric_loading.set(false);
                                         }
                                     }
@@ -2243,7 +2256,7 @@ fn HomePage() -> impl IntoView {
                                             refresh_dashboard();
                                         }
                                         Err(e) => {
-                                            check_error(e.to_string());
+                                            check_error(clean_server_error(e));
                                             set_biometric_loading.set(false);
                                         }
                                     }
@@ -2265,7 +2278,7 @@ fn HomePage() -> impl IntoView {
                     }
                 }
                 Err(e) => {
-                    check_error(e.to_string());
+                    check_error(clean_server_error(e));
                     set_biometric_loading.set(false);
                 }
             }
@@ -2354,7 +2367,7 @@ fn HomePage() -> impl IntoView {
                         refresh_dashboard();
                     }
                     Err(e) => {
-                        set_password_auth_error.set(Some(e.to_string()));
+                        set_password_auth_error.set(Some(clean_server_error(e)));
                         set_password_auth_loading.set(false);
                     }
                 }
@@ -2366,7 +2379,7 @@ fn HomePage() -> impl IntoView {
                         refresh_dashboard();
                     }
                     Err(e) => {
-                        set_password_auth_error.set(Some(e.to_string()));
+                        set_password_auth_error.set(Some(clean_server_error(e)));
                         set_password_auth_loading.set(false);
                     }
                 }
