@@ -1,9 +1,9 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, RwLock, OnceLock};
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use std::sync::{Arc, OnceLock, RwLock};
 use uuid::Uuid;
 
 // ----------------------------------------------------------------------------
@@ -17,6 +17,8 @@ pub struct User {
     pub username: String,
     pub role: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub password_hash: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -124,32 +126,38 @@ fn get_storage_path() -> String {
 }
 
 pub fn get_state() -> Arc<RwLock<RfnState>> {
-    STATE_STORE.get_or_init(|| {
-        let path_str = get_storage_path();
-        let path = Path::new(&path_str);
+    STATE_STORE
+        .get_or_init(|| {
+            let path_str = get_storage_path();
+            let path = Path::new(&path_str);
 
-        let initial_state = if path.exists() {
-            if let Ok(content) = fs::read_to_string(path) {
-                serde_json::from_str::<RfnState>(&content).unwrap_or_default()
+            let initial_state = if path.exists() {
+                if let Ok(content) = fs::read_to_string(path) {
+                    serde_json::from_str::<RfnState>(&content).unwrap_or_default()
+                } else {
+                    RfnState::default()
+                }
             } else {
-                RfnState::default()
-            }
-        } else {
-            // Seed default sponsor and pool for first-time runs
-            let mut state = RfnState::default();
-            let default_sponsor_id = Uuid::parse_str("01900000-0000-0000-0000-000000000001").unwrap();
-            state.sponsor_stats.insert(default_sponsor_id, SponsorStats {
-                account_id: default_sponsor_id,
-                tier: "King".to_string(),
-                cycle_count: 5,
-                sponsored_count: 0,
-            });
-            state.sponsor_pool.push(default_sponsor_id);
-            state
-        };
+                // Seed default sponsor and pool for first-time runs
+                let mut state = RfnState::default();
+                let default_sponsor_id =
+                    Uuid::parse_str("01900000-0000-0000-0000-000000000001").unwrap();
+                state.sponsor_stats.insert(
+                    default_sponsor_id,
+                    SponsorStats {
+                        account_id: default_sponsor_id,
+                        tier: "King".to_string(),
+                        cycle_count: 5,
+                        sponsored_count: 0,
+                    },
+                );
+                state.sponsor_pool.push(default_sponsor_id);
+                state
+            };
 
-        Arc::new(RwLock::new(initial_state))
-    }).clone()
+            Arc::new(RwLock::new(initial_state))
+        })
+        .clone()
 }
 
 pub fn save_state(state: &RfnState) {
@@ -176,7 +184,9 @@ pub struct SagaCoordinator;
 impl SagaCoordinator {
     /// Forces points progression. Triggers graduation and cascading outbox checks.
     pub fn award_points(state: &mut RfnState, account_id: Uuid, points: u32) -> Result<(), String> {
-        let account = state.flushline_accounts.get_mut(&account_id)
+        let account = state
+            .flushline_accounts
+            .get_mut(&account_id)
             .ok_or_else(|| format!("Flushline account {} not found", account_id))?;
 
         account.current_pts += points as i32;
@@ -185,7 +195,9 @@ impl SagaCoordinator {
             account.cycle_count += 1;
 
             // Trigger Coordination: Flushline Graduated
-            let coord = state.coordination_states.entry(account_id)
+            let coord = state
+                .coordination_states
+                .entry(account_id)
                 .or_insert_with(|| CoordinationState {
                     account_id,
                     is_flushline_graduated: false,
@@ -196,7 +208,10 @@ impl SagaCoordinator {
 
             // Trigger PotBonus graduation count
             if let Some(user_id) = state.pot_bonus_registrations.get(&account_id) {
-                println!("PotBonus: User {} account {} graduated!", user_id, account_id);
+                println!(
+                    "PotBonus: User {} account {} graduated!",
+                    user_id, account_id
+                );
             }
         }
 
@@ -210,15 +225,24 @@ impl SagaCoordinator {
     }
 
     /// Recursively places an account into the sponsor's filling matrix tree.
-    pub fn place_in_matrix(state: &mut RfnState, account_id: Uuid, sponsor_id: Uuid, username: &str) -> Result<(), String> {
+    pub fn place_in_matrix(
+        state: &mut RfnState,
+        account_id: Uuid,
+        sponsor_id: Uuid,
+        _username: &str,
+    ) -> Result<(), String> {
         // Find sponsor's active matrix
-        let sponsor_matrix_id = state.matrices.iter()
+        let sponsor_matrix_id = state
+            .matrices
+            .iter()
             .find(|(_, m)| m.owner_id == sponsor_id && m.status == "Filling")
             .map(|(id, _)| *id);
 
         if let Some(matrix_id) = sponsor_matrix_id {
             // Find currently occupied slots
-            let occupied_slots: Vec<i32> = state.matrix_slots.iter()
+            let occupied_slots: Vec<i32> = state
+                .matrix_slots
+                .iter()
                 .filter(|s| s.matrix_id == matrix_id)
                 .map(|s| s.slot_number)
                 .collect();
@@ -245,7 +269,9 @@ impl SagaCoordinator {
                     }
 
                     // Trigger Coordination: Matrix Cycled
-                    let coord = state.coordination_states.entry(sponsor_id)
+                    let coord = state
+                        .coordination_states
+                        .entry(sponsor_id)
                         .or_insert_with(|| CoordinationState {
                             account_id: sponsor_id,
                             is_flushline_graduated: false,
@@ -262,11 +288,14 @@ impl SagaCoordinator {
 
                     // Spawn a fresh matrix for the sponsor
                     let new_matrix_id = Uuid::new_v4();
-                    state.matrices.insert(new_matrix_id, Matrix {
-                        id: new_matrix_id,
-                        owner_id: sponsor_id,
-                        status: "Filling".to_string(),
-                    });
+                    state.matrices.insert(
+                        new_matrix_id,
+                        Matrix {
+                            id: new_matrix_id,
+                            owner_id: sponsor_id,
+                            status: "Filling".to_string(),
+                        },
+                    );
                     state.matrix_slots.push(MatrixSlot {
                         matrix_id: new_matrix_id,
                         slot_number: 1,
@@ -281,7 +310,10 @@ impl SagaCoordinator {
     }
 
     /// Saga: checks coordination state and spawns a free account if qualified.
-    pub fn check_and_spawn_free_account(state: &mut RfnState, account_id: Uuid) -> Result<Option<Uuid>, String> {
+    pub fn check_and_spawn_free_account(
+        state: &mut RfnState,
+        account_id: Uuid,
+    ) -> Result<Option<Uuid>, String> {
         let coord = match state.coordination_states.get(&account_id) {
             Some(c) => c.clone(),
             None => return Ok(None),
@@ -300,30 +332,41 @@ impl SagaCoordinator {
 
             // Create new free account ID
             let new_account_id = Uuid::new_v4();
-            let free_username = format!("FreeAccount_{}", new_account_id.to_string()[..8].to_string());
+            let free_username = format!(
+                "FreeAccount_{}",
+                new_account_id.to_string()[..8].to_string()
+            );
 
             // 1. Initialize in Flushline accounts
-            state.flushline_accounts.insert(new_account_id, FlushlineAccount {
-                id: new_account_id,
-                owner: free_username.clone(),
-                tier: "Ten".to_string(),
-                current_pts: 0,
-                cycle_count: 0,
-                graduated: false,
-            });
+            state.flushline_accounts.insert(
+                new_account_id,
+                FlushlineAccount {
+                    id: new_account_id,
+                    owner: free_username.clone(),
+                    tier: "Ten".to_string(),
+                    current_pts: 0,
+                    cycle_count: 0,
+                    graduated: false,
+                },
+            );
 
             // 2. Map to user ID (same user owns the free account)
             if let Some(user_id) = state.pot_bonus_registrations.get(&account_id).cloned() {
-                state.pot_bonus_registrations.insert(new_account_id, user_id);
+                state
+                    .pot_bonus_registrations
+                    .insert(new_account_id, user_id);
             }
 
             // 3. Create a new matrix for the free account
             let new_matrix_id = Uuid::new_v4();
-            state.matrices.insert(new_matrix_id, Matrix {
-                id: new_matrix_id,
-                owner_id: new_account_id,
-                status: "Filling".to_string(),
-            });
+            state.matrices.insert(
+                new_matrix_id,
+                Matrix {
+                    id: new_matrix_id,
+                    owner_id: new_account_id,
+                    status: "Filling".to_string(),
+                },
+            );
             state.matrix_slots.push(MatrixSlot {
                 matrix_id: new_matrix_id,
                 slot_number: 1,
@@ -336,7 +379,10 @@ impl SagaCoordinator {
             // Save final state
             save_state(state);
 
-            println!("Saga: Successfully spawned free account {} under sponsor {}", new_account_id, sponsor_id);
+            println!(
+                "Saga: Successfully spawned free account {} under sponsor {}",
+                new_account_id, sponsor_id
+            );
             Ok(Some(new_account_id))
         } else {
             Ok(None)
@@ -351,7 +397,9 @@ impl SagaCoordinator {
 
         // Find sponsor in pool with < 10 allocations
         for sponsor_id in &state.sponsor_pool {
-            let stats = state.sponsor_stats.entry(*sponsor_id)
+            let stats = state
+                .sponsor_stats
+                .entry(*sponsor_id)
                 .or_insert_with(|| SponsorStats {
                     account_id: *sponsor_id,
                     tier: "Ten".to_string(),

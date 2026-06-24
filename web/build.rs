@@ -22,7 +22,10 @@ fn main() {
         }
         _ => {
             println!("cargo:rustc-cfg=runtime_wasmtime");
-            println!("cargo:warning=Unknown runtime '{}', defaulting to Wasmtime", runtime);
+            println!(
+                "cargo:warning=Unknown runtime '{}', defaulting to Wasmtime",
+                runtime
+            );
         }
     }
 

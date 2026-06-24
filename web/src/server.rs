@@ -1,13 +1,13 @@
 use leptos::config::get_configuration;
 use leptos_wasi::executor::init_wasip3_spawner;
 use leptos_wasi::prelude::Handler;
-use wasip3::http::types::{Request, Response, ErrorCode};
+use wasip3::http::types::{ErrorCode, Request, Response};
 
 use crate::app::{
-    shell, App, RequestMagicLink, LoginViaMagicLink, SetReferralCookieSsr, Logout,
-    GetUserDashboardStatus, GetActiveSessions, RevokeSession, RevokeOtherSessions,
-    AwardPoints, RegisterPasskeyStart, RegisterPasskeyFinish, LoginPasskeyStart, LoginPasskeyFinish,
-    RegisterPasskeyFinishSignup
+    App, AwardPoints, GetActiveSessions, GetUserDashboardStatus, LoginPasskeyFinish,
+    LoginPasskeyStart, LoginViaMagicLink, Logout, RegisterPasskeyFinish,
+    RegisterPasskeyFinishSignup, RegisterPasskeyStart, RequestMagicLink, RevokeOtherSessions,
+    RevokeSession, SetReferralCookieSsr, shell,
 };
 
 struct LeptosServer;
@@ -24,7 +24,8 @@ impl wasip3::exports::http::handler::Guest for LeptosServer {
         let req = wasip3::http_compat::http_from_wasi_request(request)?;
 
         // 2. Build and handle request natively
-        let wasi_res = Handler::build(req).await
+        let wasi_res = Handler::build(req)
+            .await
             .map_err(|e| {
                 eprintln!("Error building handler: {:?}", e);
                 ErrorCode::InternalError(None)

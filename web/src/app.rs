@@ -1,12 +1,13 @@
 use leptos::prelude::*;
 use leptos_meta::*;
-use leptos_router::*;
 use leptos_router::components::{Route, Router, Routes};
 use leptos_router::hooks::use_query_map;
 use leptos_router::path;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use chrono::{Utc, Duration};
+
+#[cfg(feature = "ssr")]
+use chrono::Utc;
 
 #[cfg(feature = "hydrate")]
 use wasm_bindgen::prelude::*;
@@ -219,6 +220,8 @@ pub struct UserInfo {
     pub email: String,
     pub username: String,
     pub role: String,
+    #[serde(default)]
+    pub has_passkey: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -279,13 +282,13 @@ pub struct AwardResponse {
 #[cfg(feature = "ssr")]
 mod ssr_helpers {
     use super::*;
-    use crate::rfn_store::{get_state, RfnState, User as DbUser};
+    use crate::rfn_store::{RfnState, User as DbUser};
     use chrono::Utc;
 
     pub fn check_rate_limit() -> Result<(), ServerFnError<String>> {
+        use governor::{Quota, RateLimiter};
         use std::net::IpAddr;
         use std::num::NonZeroU32;
-        use governor::{Quota, RateLimiter};
         use std::sync::OnceLock;
 
         static IP_LIMITER: OnceLock<governor::DefaultKeyedRateLimiter<IpAddr>> = OnceLock::new();
@@ -293,7 +296,9 @@ mod ssr_helpers {
         let parts = use_context::<http::request::Parts>()
             .ok_or_else(|| ServerFnError::ServerError("Request context not found".to_string()))?;
 
-        let client_ip = parts.headers.get("x-forwarded-for")
+        let client_ip = parts
+            .headers
+            .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.split(',').next())
             .and_then(|v| v.trim().parse::<IpAddr>().ok())
@@ -306,7 +311,9 @@ mod ssr_helpers {
         });
 
         if limiter.check_key(&client_ip).is_err() {
-            return Err(ServerFnError::ServerError("Too many requests. Please try again later.".to_string()));
+            return Err(ServerFnError::ServerError(
+                "Too many requests. Please try again later.".to_string(),
+            ));
         }
 
         Ok(())
@@ -316,9 +323,13 @@ mod ssr_helpers {
         let parts = use_context::<http::request::Parts>()
             .ok_or_else(|| ServerFnError::ServerError("Request context not found".to_string()))?;
 
-        let cookie_header = parts.headers.get(http::header::COOKIE)
+        let cookie_header = parts
+            .headers
+            .get(http::header::COOKIE)
             .and_then(|h| h.to_str().ok())
-            .ok_or_else(|| ServerFnError::ServerError("Authentication required (missing cookies)".to_string()))?;
+            .ok_or_else(|| {
+                ServerFnError::ServerError("Authentication required (missing cookies)".to_string())
+            })?;
 
         let mut token = None;
         for cookie_part in cookie_header.split(';') {
@@ -329,23 +340,35 @@ mod ssr_helpers {
             }
         }
 
-        let token = token.ok_or_else(|| ServerFnError::ServerError("Authentication required (missing session token)".to_string()))?;
+        let token = token.ok_or_else(|| {
+            ServerFnError::ServerError(
+                "Authentication required (missing session token)".to_string(),
+            )
+        })?;
 
-        let session = state.sessions.get(&token)
+        let session = state
+            .sessions
+            .get(&token)
             .ok_or_else(|| ServerFnError::ServerError("Invalid or expired session".to_string()))?;
 
         if session.expires_at < Utc::now() {
-            return Err(ServerFnError::ServerError("Session has expired".to_string()));
+            return Err(ServerFnError::ServerError(
+                "Session has expired".to_string(),
+            ));
         }
 
-        let user = state.users.get(&session.user_id)
+        let user = state
+            .users
+            .get(&session.user_id)
             .ok_or_else(|| ServerFnError::ServerError("User not found".to_string()))?;
 
         Ok(user.clone())
     }
 
     pub fn resolve_sponsor_id(parts: &http::request::Parts) -> Option<Uuid> {
-        let cookie_header = parts.headers.get(http::header::COOKIE)
+        let cookie_header = parts
+            .headers
+            .get(http::header::COOKIE)
             .and_then(|h| h.to_str().ok())?;
 
         for cookie_part in cookie_header.split(';') {
@@ -361,39 +384,51 @@ mod ssr_helpers {
 }
 
 #[server(prefix = "/api")]
-pub async fn request_magic_link(email: String, username: Option<String>) -> Result<String, ServerFnError<String>> {
+pub async fn request_magic_link(
+    email: String,
+    username: Option<String>,
+) -> Result<String, ServerFnError<String>> {
     #[cfg(feature = "ssr")]
     {
-        use rand::{distributions::Alphanumeric, Rng};
-        use crate::rfn_store::{get_state, save_state, MagicLinkRecord};
+        use crate::rfn_store::{MagicLinkRecord, get_state, save_state};
         use chrono::Duration;
+        use rand::{Rng, distributions::Alphanumeric};
 
         ssr_helpers::check_rate_limit()?;
 
         let email = email.trim().to_lowercase();
         if email.is_empty() {
-            return Err(ServerFnError::ServerError("Email cannot be empty".to_string()));
+            return Err(ServerFnError::ServerError(
+                "Email cannot be empty".to_string(),
+            ));
         }
 
         let state_store = get_state();
         let mut state = state_store.write().unwrap();
 
         // 1. Verify or create user structure
-        let user_id = state.users.iter()
+        let _user_id = state
+            .users
+            .iter()
             .find(|(_, u)| u.email == email)
             .map(|(id, _)| *id)
             .unwrap_or_else(|| {
                 let id = Uuid::new_v4();
-                let display_username = username.clone()
+                let display_username = username
+                    .clone()
                     .unwrap_or_else(|| email.split('@').next().unwrap_or("user").to_string());
 
-                state.users.insert(id, crate::rfn_store::User {
+                state.users.insert(
                     id,
-                    email: email.clone(),
-                    username: display_username,
-                    role: "user".to_string(),
-                    created_at: Utc::now(),
-                });
+                    crate::rfn_store::User {
+                        id,
+                        email: email.clone(),
+                        username: display_username,
+                        role: "user".to_string(),
+                        created_at: Utc::now(),
+                        password_hash: None,
+                    },
+                );
                 id
             });
 
@@ -405,28 +440,37 @@ pub async fn request_magic_link(email: String, username: Option<String>) -> Resu
             .collect();
 
         let expires_at = Utc::now() + Duration::minutes(15);
-        state.magic_links.insert(token.clone(), MagicLinkRecord {
-            token: token.clone(),
-            email,
-            expires_at,
-            used: false,
-        });
+        state.magic_links.insert(
+            token.clone(),
+            MagicLinkRecord {
+                token: token.clone(),
+                email,
+                expires_at,
+                used: false,
+            },
+        );
 
         save_state(&state);
 
         let parts = use_context::<http::request::Parts>();
-        let host = parts.as_ref()
+        let host = parts
+            .as_ref()
             .and_then(|p| p.headers.get(http::header::HOST))
             .and_then(|h| h.to_str().ok())
             .unwrap_or("localhost:4000");
 
-        println!("MOCK EMAIL: Magic link requested. URL: http://{}/?token={}", host, token);
+        println!(
+            "MOCK EMAIL: Magic link requested. URL: http://{}/?token={}",
+            host, token
+        );
         Ok(token)
     }
     #[cfg(not(feature = "ssr"))]
     {
         let _ = (email, username);
-        Err(ServerFnError::ServerError("SSR feature not enabled".to_string()))
+        Err(ServerFnError::ServerError(
+            "SSR feature not enabled".to_string(),
+        ))
     }
 }
 
@@ -434,11 +478,11 @@ pub async fn request_magic_link(email: String, username: Option<String>) -> Resu
 pub async fn login_via_magic_link(token: String) -> Result<UserInfo, ServerFnError<String>> {
     #[cfg(feature = "ssr")]
     {
-        use rand::{distributions::Alphanumeric, Rng};
-        use crate::rfn_store::{get_state, save_state, SessionRecord, FlushlineAccount, Matrix};
+        use crate::rfn_store::{FlushlineAccount, Matrix, SessionRecord, get_state, save_state};
         use chrono::Duration;
         use http::HeaderValue;
         use leptos_wasi::response::ResponseOptions;
+        use rand::{Rng, distributions::Alphanumeric};
 
         ssr_helpers::check_rate_limit()?;
 
@@ -446,11 +490,15 @@ pub async fn login_via_magic_link(token: String) -> Result<UserInfo, ServerFnErr
         let mut state = state_store.write().unwrap();
 
         let email = {
-            let record = state.magic_links.get_mut(&token)
+            let record = state
+                .magic_links
+                .get_mut(&token)
                 .ok_or_else(|| ServerFnError::ServerError("Invalid token".to_string()))?;
 
             if record.used || record.expires_at < Utc::now() {
-                return Err(ServerFnError::ServerError("Token has expired or already been used".to_string()));
+                return Err(ServerFnError::ServerError(
+                    "Token has expired or already been used".to_string(),
+                ));
             }
 
             record.used = true;
@@ -458,7 +506,9 @@ pub async fn login_via_magic_link(token: String) -> Result<UserInfo, ServerFnErr
         };
 
         // Retrieve user
-        let user = state.users.iter()
+        let user = state
+            .users
+            .iter()
             .find(|(_, u)| u.email == email)
             .map(|(_, u)| u.clone())
             .ok_or_else(|| ServerFnError::ServerError("User not found".to_string()))?;
@@ -466,25 +516,31 @@ pub async fn login_via_magic_link(token: String) -> Result<UserInfo, ServerFnErr
         // Initialize Flushline Account and matrix tree if first time login
         let flushline_exists = state.flushline_accounts.contains_key(&user.id);
         if !flushline_exists {
-            state.flushline_accounts.insert(user.id, FlushlineAccount {
-                id: user.id,
-                owner: user.username.clone(),
-                tier: "Ten".to_string(),
-                current_pts: 0,
-                cycle_count: 0,
-                graduated: false,
-            });
+            state.flushline_accounts.insert(
+                user.id,
+                FlushlineAccount {
+                    id: user.id,
+                    owner: user.username.clone(),
+                    tier: "Ten".to_string(),
+                    current_pts: 0,
+                    cycle_count: 0,
+                    graduated: false,
+                },
+            );
 
             // Map user account
             state.pot_bonus_registrations.insert(user.id, user.id);
 
             // Create personal matrix
             let matrix_id = Uuid::new_v4();
-            state.matrices.insert(matrix_id, Matrix {
-                id: matrix_id,
-                owner_id: user.id,
-                status: "Filling".to_string(),
-            });
+            state.matrices.insert(
+                matrix_id,
+                Matrix {
+                    id: matrix_id,
+                    owner_id: user.id,
+                    status: "Filling".to_string(),
+                },
+            );
             state.matrix_slots.push(crate::rfn_store::MatrixSlot {
                 matrix_id,
                 slot_number: 1,
@@ -501,7 +557,12 @@ pub async fn login_via_magic_link(token: String) -> Result<UserInfo, ServerFnErr
             }
 
             if let Some(sp_id) = sponsor_id {
-                let _ = crate::rfn_store::SagaCoordinator::place_in_matrix(&mut state, user.id, sp_id, &user.username);
+                let _ = crate::rfn_store::SagaCoordinator::place_in_matrix(
+                    &mut state,
+                    user.id,
+                    sp_id,
+                    &user.username,
+                );
             }
         }
 
@@ -517,42 +578,368 @@ pub async fn login_via_magic_link(token: String) -> Result<UserInfo, ServerFnErr
 
         // Fetch User-Agent and IP from request parts
         let parts = use_context::<http::request::Parts>();
-        let user_agent = parts.as_ref().and_then(|p| p.headers.get(http::header::USER_AGENT)).and_then(|h| h.to_str().ok().map(|s| s.to_string()));
-        let ip_address = parts.as_ref().and_then(|p| p.headers.get("x-forwarded-for")).and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+        let user_agent = parts
+            .as_ref()
+            .and_then(|p| p.headers.get(http::header::USER_AGENT))
+            .and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+        let ip_address = parts
+            .as_ref()
+            .and_then(|p| p.headers.get("x-forwarded-for"))
+            .and_then(|h| h.to_str().ok().map(|s| s.to_string()));
 
-        state.sessions.insert(session_token.clone(), SessionRecord {
-            id: session_id,
-            user_id: user.id,
-            session_token: session_token.clone(),
-            user_agent,
-            ip_address,
-            expires_at,
-            created_at: Utc::now(),
-            last_active_at: Utc::now(),
-        });
+        state.sessions.insert(
+            session_token.clone(),
+            SessionRecord {
+                id: session_id,
+                user_id: user.id,
+                session_token: session_token.clone(),
+                user_agent,
+                ip_address,
+                expires_at,
+                created_at: Utc::now(),
+                last_active_at: Utc::now(),
+            },
+        );
 
         save_state(&state);
 
         // Set secure cookie
         if let Some(res_opts) = use_context::<ResponseOptions>() {
-            let cookie_str = format!("session_token={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800", session_token);
+            let cookie_str = format!(
+                "session_token={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800",
+                session_token
+            );
             res_opts.insert_header(
                 http::header::SET_COOKIE,
-                HeaderValue::from_str(&cookie_str).unwrap()
+                HeaderValue::from_str(&cookie_str).unwrap(),
             );
         }
+
+        let has_passkey = state.passkeys.iter().any(|pk| pk.user_id == user.id);
 
         Ok(UserInfo {
             id: user.id,
             email: user.email,
             username: user.username,
             role: user.role,
+            has_passkey,
         })
     }
     #[cfg(not(feature = "ssr"))]
     {
         let _ = token;
-        Err(ServerFnError::ServerError("SSR feature not enabled".to_string()))
+        Err(ServerFnError::ServerError(
+            "SSR feature not enabled".to_string(),
+        ))
+    }
+}
+
+#[server(prefix = "/api")]
+pub async fn check_local_testing_enabled() -> Result<bool, ServerFnError<String>> {
+    #[cfg(feature = "ssr")]
+    {
+        Ok(std::env::var("SHOW_LOCAL_TESTING_LINKS")
+            .map(|val| val == "true" || val == "1")
+            .unwrap_or(false))
+    }
+    #[cfg(not(feature = "ssr"))]
+    {
+        Err(ServerFnError::ServerError(
+            "SSR feature not enabled".to_string(),
+        ))
+    }
+}
+
+#[server(prefix = "/api")]
+pub async fn register_with_password(
+    email: String,
+    username: String,
+    password: String,
+) -> Result<UserInfo, ServerFnError<String>> {
+    #[cfg(feature = "ssr")]
+    {
+        use crate::rfn_store::{
+            FlushlineAccount, Matrix, SessionRecord, User, get_state, save_state,
+        };
+        use chrono::Duration;
+        use http::HeaderValue;
+        use leptos_wasi::response::ResponseOptions;
+        use rand::{Rng, distributions::Alphanumeric};
+
+        ssr_helpers::check_rate_limit()?;
+
+        let email = email.trim().to_lowercase();
+        if email.is_empty() {
+            return Err(ServerFnError::ServerError(
+                "Email cannot be empty".to_string(),
+            ));
+        }
+        if password.len() < 8 {
+            return Err(ServerFnError::ServerError(
+                "Password must be at least 8 characters".to_string(),
+            ));
+        }
+
+        let state_store = get_state();
+        let mut state = state_store.write().unwrap();
+
+        // Check if user already exists
+        if state.users.values().any(|u| u.email == email) {
+            return Err(ServerFnError::ServerError(
+                "This email is already registered. Please log in.".to_string(),
+            ));
+        }
+
+        // Hash password
+        let password_hash = bcrypt::hash(&password, bcrypt::DEFAULT_COST)
+            .map_err(|e| ServerFnError::ServerError(format!("Password hashing failed: {e}")))?;
+
+        let user_id = Uuid::new_v4();
+        let display_username = if username.trim().is_empty() {
+            email.split('@').next().unwrap_or("user").to_string()
+        } else {
+            username.trim().to_string()
+        };
+
+        let user = User {
+            id: user_id,
+            email: email.clone(),
+            username: display_username,
+            role: "user".to_string(),
+            created_at: Utc::now(),
+            password_hash: Some(password_hash),
+        };
+        state.users.insert(user_id, user.clone());
+
+        // Initialize Flushline Account and matrix tree
+        state.flushline_accounts.insert(
+            user_id,
+            FlushlineAccount {
+                id: user_id,
+                owner: user.username.clone(),
+                tier: "Ten".to_string(),
+                current_pts: 0,
+                cycle_count: 0,
+                graduated: false,
+            },
+        );
+
+        // Map user account
+        state.pot_bonus_registrations.insert(user_id, user_id);
+
+        // Create personal matrix
+        let matrix_id = Uuid::new_v4();
+        state.matrices.insert(
+            matrix_id,
+            Matrix {
+                id: matrix_id,
+                owner_id: user_id,
+                status: "Filling".to_string(),
+            },
+        );
+        state.matrix_slots.push(crate::rfn_store::MatrixSlot {
+            matrix_id,
+            slot_number: 1,
+            account_id: user_id,
+        });
+
+        // Read referral sponsor cookie
+        let parts = use_context::<http::request::Parts>();
+        let mut sponsor_id = parts.as_ref().and_then(ssr_helpers::resolve_sponsor_id);
+
+        // Fallback: If no sponsor_id in cookie, use the default seeded sponsor from pool
+        if sponsor_id.is_none() && !state.sponsor_pool.is_empty() {
+            sponsor_id = Some(state.sponsor_pool[0]);
+        }
+
+        if let Some(sp_id) = sponsor_id {
+            let _ = crate::rfn_store::SagaCoordinator::place_in_matrix(
+                &mut state,
+                user_id,
+                sp_id,
+                &user.username,
+            );
+        }
+
+        // Generate Session
+        let session_token: String = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(64)
+            .map(char::from)
+            .collect();
+
+        let session_id = Uuid::new_v4();
+        let expires_at = Utc::now() + Duration::days(7);
+
+        let user_agent = parts
+            .as_ref()
+            .and_then(|p| p.headers.get(http::header::USER_AGENT))
+            .and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+        let ip_address = parts
+            .as_ref()
+            .and_then(|p| p.headers.get("x-forwarded-for"))
+            .and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+
+        state.sessions.insert(
+            session_token.clone(),
+            SessionRecord {
+                id: session_id,
+                user_id,
+                session_token: session_token.clone(),
+                user_agent,
+                ip_address,
+                expires_at,
+                created_at: Utc::now(),
+                last_active_at: Utc::now(),
+            },
+        );
+
+        save_state(&state);
+
+        // Set secure cookie
+        if let Some(res_opts) = use_context::<ResponseOptions>() {
+            let cookie_str = format!(
+                "session_token={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800",
+                session_token
+            );
+            res_opts.insert_header(
+                http::header::SET_COOKIE,
+                HeaderValue::from_str(&cookie_str).unwrap(),
+            );
+        }
+
+        let has_passkey = state.passkeys.iter().any(|pk| pk.user_id == user.id);
+
+        Ok(UserInfo {
+            id: user.id,
+            email: user.email,
+            username: user.username,
+            role: user.role,
+            has_passkey,
+        })
+    }
+    #[cfg(not(feature = "ssr"))]
+    {
+        let _ = (email, username, password);
+        Err(ServerFnError::ServerError(
+            "SSR feature not enabled".to_string(),
+        ))
+    }
+}
+
+#[server(prefix = "/api")]
+pub async fn login_with_password(
+    email: String,
+    password: String,
+) -> Result<UserInfo, ServerFnError<String>> {
+    #[cfg(feature = "ssr")]
+    {
+        use crate::rfn_store::{SessionRecord, get_state, save_state};
+        use chrono::Duration;
+        use http::HeaderValue;
+        use leptos_wasi::response::ResponseOptions;
+        use rand::{Rng, distributions::Alphanumeric};
+
+        ssr_helpers::check_rate_limit()?;
+
+        let email = email.trim().to_lowercase();
+        if email.is_empty() {
+            return Err(ServerFnError::ServerError(
+                "Email cannot be empty".to_string(),
+            ));
+        }
+
+        let state_store = get_state();
+        let state = state_store.read().unwrap();
+
+        // Retrieve user
+        let user = state
+            .users
+            .values()
+            .find(|u| u.email == email)
+            .cloned()
+            .ok_or_else(|| ServerFnError::ServerError("Invalid email or password".to_string()))?;
+
+        let password_hash = user.password_hash.as_ref()
+            .ok_or_else(|| ServerFnError::ServerError("This account does not have a password configured. Please log in using Magic Link or Passkey.".to_string()))?;
+
+        let valid = bcrypt::verify(&password, password_hash).map_err(|e| {
+            ServerFnError::ServerError(format!("Password verification failed: {e}"))
+        })?;
+
+        if !valid {
+            return Err(ServerFnError::ServerError(
+                "Invalid email or password".to_string(),
+            ));
+        }
+
+        drop(state);
+        let mut state = state_store.write().unwrap();
+
+        // Generate Session
+        let session_token: String = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(64)
+            .map(char::from)
+            .collect();
+
+        let session_id = Uuid::new_v4();
+        let expires_at = Utc::now() + Duration::days(7);
+
+        let parts = use_context::<http::request::Parts>();
+        let user_agent = parts
+            .as_ref()
+            .and_then(|p| p.headers.get(http::header::USER_AGENT))
+            .and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+        let ip_address = parts
+            .as_ref()
+            .and_then(|p| p.headers.get("x-forwarded-for"))
+            .and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+
+        state.sessions.insert(
+            session_token.clone(),
+            SessionRecord {
+                id: session_id,
+                user_id: user.id,
+                session_token: session_token.clone(),
+                user_agent,
+                ip_address,
+                expires_at,
+                created_at: Utc::now(),
+                last_active_at: Utc::now(),
+            },
+        );
+
+        save_state(&state);
+
+        // Set secure cookie
+        if let Some(res_opts) = use_context::<ResponseOptions>() {
+            let cookie_str = format!(
+                "session_token={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800",
+                session_token
+            );
+            res_opts.insert_header(
+                http::header::SET_COOKIE,
+                HeaderValue::from_str(&cookie_str).unwrap(),
+            );
+        }
+
+        let has_passkey = state.passkeys.iter().any(|pk| pk.user_id == user.id);
+
+        Ok(UserInfo {
+            id: user.id,
+            email: user.email,
+            username: user.username,
+            role: user.role,
+            has_passkey,
+        })
+    }
+    #[cfg(not(feature = "ssr"))]
+    {
+        let _ = (email, password);
+        Err(ServerFnError::ServerError(
+            "SSR feature not enabled".to_string(),
+        ))
     }
 }
 
@@ -566,10 +953,13 @@ pub async fn set_referral_cookie_ssr(sponsor_id: Uuid) -> Result<(), ServerFnErr
         ssr_helpers::check_rate_limit()?;
 
         if let Some(res_opts) = use_context::<ResponseOptions>() {
-            let cookie_str = format!("sponsor_id={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000", sponsor_id);
+            let cookie_str = format!(
+                "sponsor_id={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000",
+                sponsor_id
+            );
             res_opts.insert_header(
                 http::header::SET_COOKIE,
-                HeaderValue::from_str(&cookie_str).unwrap()
+                HeaderValue::from_str(&cookie_str).unwrap(),
             );
         }
         Ok(())
@@ -577,7 +967,9 @@ pub async fn set_referral_cookie_ssr(sponsor_id: Uuid) -> Result<(), ServerFnErr
     #[cfg(not(feature = "ssr"))]
     {
         let _ = sponsor_id;
-        Err(ServerFnError::ServerError("SSR feature not enabled".to_string()))
+        Err(ServerFnError::ServerError(
+            "SSR feature not enabled".to_string(),
+        ))
     }
 }
 
@@ -593,10 +985,14 @@ pub async fn logout() -> Result<(), ServerFnError<String>> {
 
         let state_store = get_state();
         let mut state = state_store.write().unwrap();
-        
+
         // Find session from cookie
         if let Some(parts) = use_context::<http::request::Parts>() {
-            if let Some(cookie_header) = parts.headers.get(http::header::COOKIE).and_then(|h| h.to_str().ok()) {
+            if let Some(cookie_header) = parts
+                .headers
+                .get(http::header::COOKIE)
+                .and_then(|h| h.to_str().ok())
+            {
                 let mut token = None;
                 for cookie_part in cookie_header.split(';') {
                     let trimmed = cookie_part.trim();
@@ -617,7 +1013,9 @@ pub async fn logout() -> Result<(), ServerFnError<String>> {
         if let Some(res_opts) = use_context::<ResponseOptions>() {
             res_opts.insert_header(
                 http::header::SET_COOKIE,
-                HeaderValue::from_static("session_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
+                HeaderValue::from_static(
+                    "session_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+                ),
             );
         }
 
@@ -625,7 +1023,9 @@ pub async fn logout() -> Result<(), ServerFnError<String>> {
     }
     #[cfg(not(feature = "ssr"))]
     {
-        Err(ServerFnError::ServerError("SSR feature not enabled".to_string()))
+        Err(ServerFnError::ServerError(
+            "SSR feature not enabled".to_string(),
+        ))
     }
 }
 
@@ -646,27 +1046,34 @@ pub async fn get_user_dashboard_status() -> Result<DashboardStatus, ServerFnErro
         };
 
         // 2. Fetch Flushline Info
-        let flushline = state.flushline_accounts.get(&user.id).map(|fa| FlushlineInfo {
-            id: fa.id,
-            owner: fa.owner.clone(),
-            tier: fa.tier.clone(),
-            current_pts: fa.current_pts,
-            cycle_count: fa.cycle_count,
-            graduated: fa.graduated,
-        });
+        let flushline = state
+            .flushline_accounts
+            .get(&user.id)
+            .map(|fa| FlushlineInfo {
+                id: fa.id,
+                owner: fa.owner.clone(),
+                tier: fa.tier.clone(),
+                current_pts: fa.current_pts,
+                cycle_count: fa.cycle_count,
+                graduated: fa.graduated,
+            });
 
         // 3. Fetch Matrix Info
-        let matrix = state.matrices.iter()
+        let matrix = state
+            .matrices
+            .iter()
             .find(|(_, m)| m.owner_id == user.id && m.status == "Filling")
             .map(|(id, m)| {
                 // Load slots for this matrix
                 let mut slot_infos = Vec::new();
                 for slot in &state.matrix_slots {
                     if slot.matrix_id == *id {
-                        let username = state.flushline_accounts.get(&slot.account_id)
+                        let username = state
+                            .flushline_accounts
+                            .get(&slot.account_id)
                             .map(|a| a.owner.clone())
                             .unwrap_or_else(|| "Empty".to_string());
-                        
+
                         slot_infos.push(MatrixSlotInfo {
                             slot_number: slot.slot_number,
                             username,
@@ -696,11 +1103,15 @@ pub async fn get_user_dashboard_status() -> Result<DashboardStatus, ServerFnErro
 
         // 4. Resolve sponsor ID from cookie or state
         let parts = use_context::<http::request::Parts>();
-        let sponsor_id = parts.as_ref().and_then(ssr_helpers::resolve_sponsor_id)
+        let sponsor_id = parts
+            .as_ref()
+            .and_then(ssr_helpers::resolve_sponsor_id)
             .or_else(|| {
                 // fallback to first sponsor in state pool
                 state.sponsor_pool.first().cloned()
             });
+
+        let has_passkey = state.passkeys.iter().any(|pk| pk.user_id == user.id);
 
         Ok(DashboardStatus {
             user: Some(UserInfo {
@@ -708,6 +1119,7 @@ pub async fn get_user_dashboard_status() -> Result<DashboardStatus, ServerFnErro
                 email: user.email,
                 username: user.username,
                 role: user.role,
+                has_passkey,
             }),
             flushline,
             matrix,
@@ -733,7 +1145,11 @@ pub async fn get_active_sessions() -> Result<Vec<SessionInfo>, ServerFnError<Str
 
         // Find current token from cookies
         let parts = use_context::<http::request::Parts>().unwrap();
-        let cookie_header = parts.headers.get(http::header::COOKIE).and_then(|h| h.to_str().ok()).unwrap_or("");
+        let cookie_header = parts
+            .headers
+            .get(http::header::COOKIE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
         let mut current_token = "";
         for cookie_part in cookie_header.split(';') {
             let trimmed = cookie_part.trim();
@@ -743,7 +1159,9 @@ pub async fn get_active_sessions() -> Result<Vec<SessionInfo>, ServerFnError<Str
             }
         }
 
-        let sessions: Vec<SessionInfo> = state.sessions.values()
+        let sessions: Vec<SessionInfo> = state
+            .sessions
+            .values()
             .filter(|s| s.user_id == user.id && s.expires_at > Utc::now())
             .map(|s| SessionInfo {
                 id: s.id,
@@ -788,7 +1206,9 @@ pub async fn revoke_session(session_id: Uuid) -> Result<(), ServerFnError<String
             save_state(&state);
             Ok(())
         } else {
-            Err(ServerFnError::ServerError("Session not found or permission denied".to_string()))
+            Err(ServerFnError::ServerError(
+                "Session not found or permission denied".to_string(),
+            ))
         }
     }
     #[cfg(not(feature = "ssr"))]
@@ -811,7 +1231,11 @@ pub async fn revoke_other_sessions() -> Result<(), ServerFnError<String>> {
 
         // Find current token from cookies
         let parts = use_context::<http::request::Parts>().unwrap();
-        let cookie_header = parts.headers.get(http::header::COOKIE).and_then(|h| h.to_str().ok()).unwrap_or("");
+        let cookie_header = parts
+            .headers
+            .get(http::header::COOKIE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
         let mut current_token = String::new();
         for cookie_part in cookie_header.split(';') {
             let trimmed = cookie_part.trim();
@@ -821,9 +1245,9 @@ pub async fn revoke_other_sessions() -> Result<(), ServerFnError<String>> {
             }
         }
 
-        state.sessions.retain(|token, s| {
-            s.user_id != user.id || *token == current_token
-        });
+        state
+            .sessions
+            .retain(|token, s| s.user_id != user.id || *token == current_token);
 
         save_state(&state);
         Ok(())
@@ -838,7 +1262,7 @@ pub async fn revoke_other_sessions() -> Result<(), ServerFnError<String>> {
 pub async fn award_points(points: u32) -> Result<AwardResponse, ServerFnError<String>> {
     #[cfg(feature = "ssr")]
     {
-        use crate::rfn_store::{get_state, SagaCoordinator};
+        use crate::rfn_store::{SagaCoordinator, get_state};
 
         ssr_helpers::check_rate_limit()?;
         let state_store = get_state();
@@ -851,12 +1275,17 @@ pub async fn award_points(points: u32) -> Result<AwardResponse, ServerFnError<St
 
         let account = state.flushline_accounts.get(&user.id).unwrap();
         let coord = state.coordination_states.get(&user.id);
-        
+
         let new_spawned_account = if let Some(c) = coord {
             if c.new_account_spawned {
                 // Retrieve the newly spawned free account owned by this user
-                state.flushline_accounts.values()
-                    .find(|a| a.owner.starts_with("FreeAccount_") && state.pot_bonus_registrations.get(&a.id) == Some(&user.id))
+                state
+                    .flushline_accounts
+                    .values()
+                    .find(|a| {
+                        a.owner.starts_with("FreeAccount_")
+                            && state.pot_bonus_registrations.get(&a.id) == Some(&user.id)
+                    })
                     .map(|a| a.id)
             } else {
                 None
@@ -888,9 +1317,9 @@ pub async fn award_points(points: u32) -> Result<AwardResponse, ServerFnError<St
 pub async fn register_passkey_start() -> Result<String, ServerFnError<String>> {
     #[cfg(feature = "ssr")]
     {
-        use crate::rfn_store::{get_state, save_state, ChallengeRecord};
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use crate::rfn_store::{ChallengeRecord, get_state, save_state};
         use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use chrono::Duration;
 
         ssr_helpers::check_rate_limit()?;
@@ -900,7 +1329,7 @@ pub async fn register_passkey_start() -> Result<String, ServerFnError<String>> {
 
         let challenge_bytes: [u8; 32] = rand::random();
         let challenge_b64 = URL_SAFE_NO_PAD.encode(challenge_bytes);
-        
+
         let user_id_b64 = URL_SAFE_NO_PAD.encode(user.id.as_bytes());
 
         let challenge_response = CreationChallengeResponse {
@@ -916,8 +1345,14 @@ pub async fn register_passkey_start() -> Result<String, ServerFnError<String>> {
                     displayName: user.username.clone(),
                 },
                 pubKeyCredParams: vec![
-                    PubKeyCredParam { alg: -7, cred_type: "public-key".to_string() }, // ES256
-                    PubKeyCredParam { alg: -257, cred_type: "public-key".to_string() }, // RS256
+                    PubKeyCredParam {
+                        alg: -7,
+                        cred_type: "public-key".to_string(),
+                    }, // ES256
+                    PubKeyCredParam {
+                        alg: -257,
+                        cred_type: "public-key".to_string(),
+                    }, // RS256
                 ],
                 timeout: 60000,
                 excludeCredentials: vec![],
@@ -927,19 +1362,22 @@ pub async fn register_passkey_start() -> Result<String, ServerFnError<String>> {
                     userVerification: "preferred".to_string(),
                 },
                 attestation: "none".to_string(),
-            }
+            },
         };
 
         let challenge_id = Uuid::new_v4();
         let challenge_json = serde_json::to_value(&challenge_response).unwrap();
 
-        state.challenges.insert(challenge_id, ChallengeRecord {
+        state.challenges.insert(
             challenge_id,
-            user_id: Some(user.id),
-            challenge_json,
-            expires_at: Utc::now() + Duration::minutes(10),
-            email: Some(user.email.clone()),
-        });
+            ChallengeRecord {
+                challenge_id,
+                user_id: Some(user.id),
+                challenge_json,
+                expires_at: Utc::now() + Duration::minutes(10),
+                email: Some(user.email.clone()),
+            },
+        );
 
         save_state(&state);
 
@@ -955,7 +1393,7 @@ pub async fn register_passkey_start() -> Result<String, ServerFnError<String>> {
 pub async fn register_passkey_finish(credential_json: String) -> Result<(), ServerFnError<String>> {
     #[cfg(feature = "ssr")]
     {
-        use crate::rfn_store::{get_state, save_state, PasskeyRecord};
+        use crate::rfn_store::{PasskeyRecord, get_state, save_state};
         use base64::Engine;
 
         ssr_helpers::check_rate_limit()?;
@@ -967,14 +1405,19 @@ pub async fn register_passkey_finish(credential_json: String) -> Result<(), Serv
             .map_err(|e| ServerFnError::ServerError(format!("Failed to parse credential: {e}")))?;
 
         // Find active challenge for user
-        let challenge_id = state.challenges.iter()
+        let challenge_id = state
+            .challenges
+            .iter()
             .find(|(_, c)| c.user_id == Some(user.id) && c.expires_at > Utc::now())
             .map(|(id, _)| *id)
-            .ok_or_else(|| ServerFnError::ServerError("Challenge expired or not found".to_string()))?;
+            .ok_or_else(|| {
+                ServerFnError::ServerError("Challenge expired or not found".to_string())
+            })?;
 
         state.challenges.remove(&challenge_id);
 
-        let cred_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&credential.id)
+        let cred_id = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&credential.id)
             .unwrap_or_else(|_| credential.id.as_bytes().to_vec());
 
         state.passkeys.push(PasskeyRecord {
@@ -1007,12 +1450,14 @@ pub enum PasskeyStartResponse {
 }
 
 #[server(prefix = "/api")]
-pub async fn login_passkey_start(email: String) -> Result<PasskeyStartResponse, ServerFnError<String>> {
+pub async fn login_passkey_start(
+    email: String,
+) -> Result<PasskeyStartResponse, ServerFnError<String>> {
     #[cfg(feature = "ssr")]
     {
-        use crate::rfn_store::{get_state, save_state, ChallengeRecord};
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use crate::rfn_store::{ChallengeRecord, get_state, save_state};
         use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use chrono::Duration;
 
         ssr_helpers::check_rate_limit()?;
@@ -1031,20 +1476,23 @@ pub async fn login_passkey_start(email: String) -> Result<PasskeyStartResponse, 
                     rpId: "localhost".to_string(),
                     allowCredentials: vec![],
                     userVerification: "preferred".to_string(),
-                }
+                },
             };
 
             let mut state = state_store.write().unwrap();
             let challenge_id = Uuid::new_v4();
             let challenge_json = serde_json::to_value(&challenge_response).unwrap();
 
-            state.challenges.insert(challenge_id, ChallengeRecord {
+            state.challenges.insert(
                 challenge_id,
-                user_id: None,
-                challenge_json,
-                expires_at: Utc::now() + Duration::minutes(10),
-                email: None,
-            });
+                ChallengeRecord {
+                    challenge_id,
+                    user_id: None,
+                    challenge_json,
+                    expires_at: Utc::now() + Duration::minutes(10),
+                    email: None,
+                },
+            );
 
             save_state(&state);
 
@@ -1056,14 +1504,14 @@ pub async fn login_passkey_start(email: String) -> Result<PasskeyStartResponse, 
         }
 
         let state = state_store.read().unwrap();
-        let user_opt = state.users.values()
-            .find(|u| u.email == email)
-            .cloned();
+        let user_opt = state.users.values().find(|u| u.email == email).cloned();
 
         match user_opt {
             Some(user) => {
                 // Find registered credentials
-                let user_passkeys: Vec<crate::rfn_store::PasskeyRecord> = state.passkeys.iter()
+                let user_passkeys: Vec<crate::rfn_store::PasskeyRecord> = state
+                    .passkeys
+                    .iter()
                     .filter(|pk| pk.user_id == user.id)
                     .cloned()
                     .collect();
@@ -1072,14 +1520,17 @@ pub async fn login_passkey_start(email: String) -> Result<PasskeyStartResponse, 
                     return Err(ServerFnError::ServerError("This account exists but has no passkeys registered. Please log in using a Magic Link first, then enroll your device under Settings.".to_string()));
                 }
 
-                let allow_credentials = user_passkeys.iter().map(|pk| {
-                    let cred_id_b64 = URL_SAFE_NO_PAD.encode(&pk.credential_id);
-                    CredentialDescriptor {
-                        cred_type: "public-key".to_string(),
-                        id: cred_id_b64,
-                        transports: None,
-                    }
-                }).collect();
+                let allow_credentials = user_passkeys
+                    .iter()
+                    .map(|pk| {
+                        let cred_id_b64 = URL_SAFE_NO_PAD.encode(&pk.credential_id);
+                        CredentialDescriptor {
+                            cred_type: "public-key".to_string(),
+                            id: cred_id_b64,
+                            transports: None,
+                        }
+                    })
+                    .collect();
 
                 let challenge_response = RequestChallengeResponse {
                     public_key: PublicKeyCredentialRequestOptions {
@@ -1088,7 +1539,7 @@ pub async fn login_passkey_start(email: String) -> Result<PasskeyStartResponse, 
                         rpId: "localhost".to_string(),
                         allowCredentials: allow_credentials,
                         userVerification: "preferred".to_string(),
-                    }
+                    },
                 };
 
                 drop(state);
@@ -1097,13 +1548,16 @@ pub async fn login_passkey_start(email: String) -> Result<PasskeyStartResponse, 
                 let challenge_id = Uuid::new_v4();
                 let challenge_json = serde_json::to_value(&challenge_response).unwrap();
 
-                state.challenges.insert(challenge_id, ChallengeRecord {
+                state.challenges.insert(
                     challenge_id,
-                    user_id: Some(user.id),
-                    challenge_json,
-                    expires_at: Utc::now() + Duration::minutes(10),
-                    email: Some(user.email.clone()),
-                });
+                    ChallengeRecord {
+                        challenge_id,
+                        user_id: Some(user.id),
+                        challenge_json,
+                        expires_at: Utc::now() + Duration::minutes(10),
+                        email: Some(user.email.clone()),
+                    },
+                );
 
                 save_state(&state);
 
@@ -1133,8 +1587,14 @@ pub async fn login_passkey_start(email: String) -> Result<PasskeyStartResponse, 
                             displayName: display_username.clone(),
                         },
                         pubKeyCredParams: vec![
-                            PubKeyCredParam { alg: -7, cred_type: "public-key".to_string() }, // ES256
-                            PubKeyCredParam { alg: -257, cred_type: "public-key".to_string() }, // RS256
+                            PubKeyCredParam {
+                                alg: -7,
+                                cred_type: "public-key".to_string(),
+                            }, // ES256
+                            PubKeyCredParam {
+                                alg: -257,
+                                cred_type: "public-key".to_string(),
+                            }, // RS256
                         ],
                         timeout: 60000,
                         excludeCredentials: vec![],
@@ -1144,7 +1604,7 @@ pub async fn login_passkey_start(email: String) -> Result<PasskeyStartResponse, 
                             userVerification: "preferred".to_string(),
                         },
                         attestation: "none".to_string(),
-                    }
+                    },
                 };
 
                 drop(state);
@@ -1153,13 +1613,16 @@ pub async fn login_passkey_start(email: String) -> Result<PasskeyStartResponse, 
                 let challenge_id = Uuid::new_v4();
                 let challenge_json = serde_json::to_value(&challenge_response).unwrap();
 
-                state.challenges.insert(challenge_id, ChallengeRecord {
+                state.challenges.insert(
                     challenge_id,
-                    user_id: Some(new_user_id),
-                    challenge_json,
-                    expires_at: Utc::now() + Duration::minutes(10),
-                    email: Some(email.clone()),
-                });
+                    ChallengeRecord {
+                        challenge_id,
+                        user_id: Some(new_user_id),
+                        challenge_json,
+                        expires_at: Utc::now() + Duration::minutes(10),
+                        email: Some(email.clone()),
+                    },
+                );
 
                 save_state(&state);
 
@@ -1181,22 +1644,26 @@ pub async fn login_passkey_start(email: String) -> Result<PasskeyStartResponse, 
 }
 
 #[server(prefix = "/api")]
-pub async fn login_passkey_finish(challenge_id: Uuid, credential_json: String) -> Result<UserInfo, ServerFnError<String>> {
+pub async fn login_passkey_finish(
+    challenge_id: Uuid,
+    credential_json: String,
+) -> Result<UserInfo, ServerFnError<String>> {
     #[cfg(feature = "ssr")]
     {
-        use rand::{distributions::Alphanumeric, Rng};
-        use crate::rfn_store::{get_state, save_state, SessionRecord};
+        use crate::rfn_store::{SessionRecord, get_state, save_state};
+        use base64::Engine;
         use chrono::Duration;
         use http::HeaderValue;
         use leptos_wasi::response::ResponseOptions;
-        use base64::Engine;
+        use rand::{Rng, distributions::Alphanumeric};
 
         ssr_helpers::check_rate_limit()?;
         let state_store = get_state();
         let mut state = state_store.write().unwrap();
 
-        let record = state.challenges.remove(&challenge_id)
-            .ok_or_else(|| ServerFnError::ServerError("Challenge expired or not found".to_string()))?;
+        let record = state.challenges.remove(&challenge_id).ok_or_else(|| {
+            ServerFnError::ServerError("Challenge expired or not found".to_string())
+        })?;
 
         let credential: PublicKeyCredential = serde_json::from_str(&credential_json)
             .map_err(|e| ServerFnError::ServerError(format!("Invalid credential format: {e}")))?;
@@ -1205,18 +1672,27 @@ pub async fn login_passkey_finish(challenge_id: Uuid, credential_json: String) -
             Some(uid) => uid,
             None => {
                 // Discoverable login: look up credential.id/rawId
-                let incoming_cred_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&credential.id)
+                let incoming_cred_id = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&credential.id)
                     .unwrap_or_else(|_| credential.id.as_bytes().to_vec());
 
-                state.passkeys.iter()
+                state
+                    .passkeys
+                    .iter()
                     .find(|pk| pk.credential_id == incoming_cred_id)
                     .map(|pk| pk.user_id)
-                    .ok_or_else(|| ServerFnError::ServerError("No registered user found matching this passkey".to_string()))?
+                    .ok_or_else(|| {
+                        ServerFnError::ServerError(
+                            "No registered user found matching this passkey".to_string(),
+                        )
+                    })?
             }
         };
 
         // Retrieve user
-        let user = state.users.get(&user_id)
+        let user = state
+            .users
+            .get(&user_id)
             .ok_or_else(|| ServerFnError::ServerError("User not found".to_string()))?
             .clone();
 
@@ -1232,36 +1708,51 @@ pub async fn login_passkey_finish(challenge_id: Uuid, credential_json: String) -
 
         // Fetch headers
         let parts = use_context::<http::request::Parts>();
-        let user_agent = parts.as_ref().and_then(|p| p.headers.get(http::header::USER_AGENT)).and_then(|h| h.to_str().ok().map(|s| s.to_string()));
-        let ip_address = parts.as_ref().and_then(|p| p.headers.get("x-forwarded-for")).and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+        let user_agent = parts
+            .as_ref()
+            .and_then(|p| p.headers.get(http::header::USER_AGENT))
+            .and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+        let ip_address = parts
+            .as_ref()
+            .and_then(|p| p.headers.get("x-forwarded-for"))
+            .and_then(|h| h.to_str().ok().map(|s| s.to_string()));
 
-        state.sessions.insert(session_token.clone(), SessionRecord {
-            id: session_id,
-            user_id: user.id,
-            session_token: session_token.clone(),
-            user_agent,
-            ip_address,
-            expires_at,
-            created_at: Utc::now(),
-            last_active_at: Utc::now(),
-        });
+        state.sessions.insert(
+            session_token.clone(),
+            SessionRecord {
+                id: session_id,
+                user_id: user.id,
+                session_token: session_token.clone(),
+                user_agent,
+                ip_address,
+                expires_at,
+                created_at: Utc::now(),
+                last_active_at: Utc::now(),
+            },
+        );
 
         save_state(&state);
 
         // Set secure cookie
         if let Some(res_opts) = use_context::<ResponseOptions>() {
-            let cookie_str = format!("session_token={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800", session_token);
+            let cookie_str = format!(
+                "session_token={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800",
+                session_token
+            );
             res_opts.insert_header(
                 http::header::SET_COOKIE,
-                HeaderValue::from_str(&cookie_str).unwrap()
+                HeaderValue::from_str(&cookie_str).unwrap(),
             );
         }
+
+        let has_passkey = state.passkeys.iter().any(|pk| pk.user_id == user.id);
 
         Ok(UserInfo {
             id: user.id,
             email: user.email,
             username: user.username,
             role: user.role,
+            has_passkey,
         })
     }
     #[cfg(not(feature = "ssr"))]
@@ -1272,29 +1763,42 @@ pub async fn login_passkey_finish(challenge_id: Uuid, credential_json: String) -
 }
 
 #[server(prefix = "/api")]
-pub async fn register_passkey_finish_signup(challenge_id: Uuid, credential_json: String) -> Result<UserInfo, ServerFnError<String>> {
+pub async fn register_passkey_finish_signup(
+    challenge_id: Uuid,
+    credential_json: String,
+) -> Result<UserInfo, ServerFnError<String>> {
     #[cfg(feature = "ssr")]
     {
-        use rand::{distributions::Alphanumeric, Rng};
-        use crate::rfn_store::{get_state, save_state, SessionRecord, PasskeyRecord, FlushlineAccount, Matrix, SagaCoordinator};
+        use crate::rfn_store::{
+            FlushlineAccount, Matrix, PasskeyRecord, SagaCoordinator, SessionRecord, get_state,
+            save_state,
+        };
         use base64::Engine;
         use chrono::Duration;
         use http::HeaderValue;
         use leptos_wasi::response::ResponseOptions;
+        use rand::{Rng, distributions::Alphanumeric};
 
         ssr_helpers::check_rate_limit()?;
         let state_store = get_state();
         let mut state = state_store.write().unwrap();
 
-        let record = state.challenges.remove(&challenge_id)
-            .ok_or_else(|| ServerFnError::ServerError("Challenge expired or not found".to_string()))?;
+        let record = state.challenges.remove(&challenge_id).ok_or_else(|| {
+            ServerFnError::ServerError("Challenge expired or not found".to_string())
+        })?;
 
-        let user_id = record.user_id.ok_or_else(|| ServerFnError::ServerError("Invalid challenge record".to_string()))?;
-        let email = record.email.ok_or_else(|| ServerFnError::ServerError("Email not associated with this challenge".to_string()))?;
+        let user_id = record
+            .user_id
+            .ok_or_else(|| ServerFnError::ServerError("Invalid challenge record".to_string()))?;
+        let email = record.email.ok_or_else(|| {
+            ServerFnError::ServerError("Email not associated with this challenge".to_string())
+        })?;
 
         // 1. Double check if email already registered
         if state.users.values().any(|u| u.email == email) {
-            return Err(ServerFnError::ServerError("This email is already registered.".to_string()));
+            return Err(ServerFnError::ServerError(
+                "This email is already registered.".to_string(),
+            ));
         }
 
         let username = email.split('@').next().unwrap_or("user").to_string();
@@ -1306,6 +1810,7 @@ pub async fn register_passkey_finish_signup(challenge_id: Uuid, credential_json:
             username: username.clone(),
             role: "user".to_string(),
             created_at: Utc::now(),
+            password_hash: None,
         };
         state.users.insert(user_id, user.clone());
 
@@ -1313,7 +1818,8 @@ pub async fn register_passkey_finish_signup(challenge_id: Uuid, credential_json:
         let credential: RegisterPublicKeyCredential = serde_json::from_str(&credential_json)
             .map_err(|e| ServerFnError::ServerError(format!("Failed to parse credential: {e}")))?;
 
-        let cred_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&credential.id)
+        let cred_id = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&credential.id)
             .unwrap_or_else(|_| credential.id.as_bytes().to_vec());
 
         state.passkeys.push(PasskeyRecord {
@@ -1323,23 +1829,29 @@ pub async fn register_passkey_finish_signup(challenge_id: Uuid, credential_json:
         });
 
         // 4. Initialize Flushline Account and matrix tree (same as magic link signup)
-        state.flushline_accounts.insert(user_id, FlushlineAccount {
-            id: user_id,
-            owner: username.clone(),
-            tier: "Ten".to_string(),
-            current_pts: 0,
-            cycle_count: 0,
-            graduated: false,
-        });
+        state.flushline_accounts.insert(
+            user_id,
+            FlushlineAccount {
+                id: user_id,
+                owner: username.clone(),
+                tier: "Ten".to_string(),
+                current_pts: 0,
+                cycle_count: 0,
+                graduated: false,
+            },
+        );
 
         state.pot_bonus_registrations.insert(user_id, user_id);
 
         let matrix_id = Uuid::new_v4();
-        state.matrices.insert(matrix_id, Matrix {
-            id: matrix_id,
-            owner_id: user_id,
-            status: "Filling".to_string(),
-        });
+        state.matrices.insert(
+            matrix_id,
+            Matrix {
+                id: matrix_id,
+                owner_id: user_id,
+                status: "Filling".to_string(),
+            },
+        );
         state.matrix_slots.push(crate::rfn_store::MatrixSlot {
             matrix_id,
             slot_number: 1,
@@ -1368,46 +1880,61 @@ pub async fn register_passkey_finish_signup(challenge_id: Uuid, credential_json:
         let session_id = Uuid::new_v4();
         let expires_at = Utc::now() + Duration::days(7);
 
-        let user_agent = parts.as_ref().and_then(|p| p.headers.get(http::header::USER_AGENT)).and_then(|h| h.to_str().ok().map(|s| s.to_string()));
-        let ip_address = parts.as_ref().and_then(|p| p.headers.get("x-forwarded-for")).and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+        let user_agent = parts
+            .as_ref()
+            .and_then(|p| p.headers.get(http::header::USER_AGENT))
+            .and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+        let ip_address = parts
+            .as_ref()
+            .and_then(|p| p.headers.get("x-forwarded-for"))
+            .and_then(|h| h.to_str().ok().map(|s| s.to_string()));
 
-        state.sessions.insert(session_token.clone(), SessionRecord {
-            id: session_id,
-            user_id,
-            session_token: session_token.clone(),
-            user_agent,
-            ip_address,
-            expires_at,
-            created_at: Utc::now(),
-            last_active_at: Utc::now(),
-        });
+        state.sessions.insert(
+            session_token.clone(),
+            SessionRecord {
+                id: session_id,
+                user_id,
+                session_token: session_token.clone(),
+                user_agent,
+                ip_address,
+                expires_at,
+                created_at: Utc::now(),
+                last_active_at: Utc::now(),
+            },
+        );
 
         save_state(&state);
 
         // Set secure cookie
         if let Some(res_opts) = use_context::<ResponseOptions>() {
-            let cookie_str = format!("session_token={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800", session_token);
+            let cookie_str = format!(
+                "session_token={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800",
+                session_token
+            );
             res_opts.insert_header(
                 http::header::SET_COOKIE,
-                HeaderValue::from_str(&cookie_str).unwrap()
+                HeaderValue::from_str(&cookie_str).unwrap(),
             );
         }
+
+        let has_passkey = state.passkeys.iter().any(|pk| pk.user_id == user.id);
 
         Ok(UserInfo {
             id: user.id,
             email: user.email,
             username: user.username,
             role: user.role,
+            has_passkey,
         })
     }
     #[cfg(not(feature = "ssr"))]
     {
         let _ = (challenge_id, credential_json);
-        Err(ServerFnError::ServerError("SSR feature not enabled".to_string()))
+        Err(ServerFnError::ServerError(
+            "SSR feature not enabled".to_string(),
+        ))
     }
 }
-
-
 
 // ----------------------------------------------------------------------------
 // Client Views and Components
@@ -1469,7 +1996,11 @@ fn HomePage() -> impl IntoView {
             if let Some(window) = web_sys::window() {
                 if let Ok(ua) = window.navigator().user_agent() {
                     let ua_lower = ua.to_lowercase();
-                    if ua_lower.contains("mac") || ua_lower.contains("iphone") || ua_lower.contains("ipad") || ua_lower.contains("ipod") {
+                    if ua_lower.contains("mac")
+                        || ua_lower.contains("iphone")
+                        || ua_lower.contains("ipad")
+                        || ua_lower.contains("ipod")
+                    {
                         set_os_brand.set("Apple".to_string());
                     } else if ua_lower.contains("win") {
                         set_os_brand.set("Windows".to_string());
@@ -1483,17 +2014,27 @@ fn HomePage() -> impl IntoView {
         }
     });
 
-    let biometric_btn_class = move || {
-        match os_brand.get().as_str() {
-            "Apple" => "w-full py-3 bg-[#111] hover:bg-black text-white font-semibold rounded-xl border border-zinc-800 hover:border-zinc-700 transition-all duration-150 flex items-center justify-center gap-2.5 text-sm disabled:opacity-50 shadow-lg shadow-black/20",
-            "Windows" => "w-full py-3 bg-[#0c1f38] hover:bg-[#122b4d] text-[#00ebff] font-semibold rounded-xl border border-[#0078d4]/60 hover:border-[#0078d4] transition-all duration-150 flex items-center justify-center gap-2.5 text-sm disabled:opacity-50 shadow-lg shadow-[#0078d4]/10",
-            "Android" => "w-full py-3 bg-[#0d2a1d] hover:bg-[#123d2a] text-[#3ddc84] font-semibold rounded-xl border border-[#3ddc84]/40 hover:border-[#3ddc84] transition-all duration-150 flex items-center justify-center gap-2.5 text-sm disabled:opacity-50 shadow-lg shadow-emerald-950/20",
-            _ => "w-full py-3 bg-[#1e293b] hover:bg-[#334155] text-white font-semibold rounded-xl border border-[#334155] hover:border-slate-400 transition-all duration-150 flex items-center justify-center gap-2.5 text-sm disabled:opacity-50"
+    let biometric_btn_class = move || match os_brand.get().as_str() {
+        "Apple" => {
+            "w-full py-3 bg-[#111] hover:bg-black text-white font-semibold rounded-xl border border-zinc-800 hover:border-zinc-700 transition-all duration-150 flex items-center justify-center gap-2.5 text-sm disabled:opacity-50 shadow-lg shadow-black/20"
+        }
+        "Windows" => {
+            "w-full py-3 bg-[#0c1f38] hover:bg-[#122b4d] text-[#00ebff] font-semibold rounded-xl border border-[#0078d4]/60 hover:border-[#0078d4] transition-all duration-150 flex items-center justify-center gap-2.5 text-sm disabled:opacity-50 shadow-lg shadow-[#0078d4]/10"
+        }
+        "Android" => {
+            "w-full py-3 bg-[#0d2a1d] hover:bg-[#123d2a] text-[#3ddc84] font-semibold rounded-xl border border-[#3ddc84]/40 hover:border-[#3ddc84] transition-all duration-150 flex items-center justify-center gap-2.5 text-sm disabled:opacity-50 shadow-lg shadow-emerald-950/20"
+        }
+        _ => {
+            "w-full py-3 bg-[#1e293b] hover:bg-[#334155] text-white font-semibold rounded-xl border border-[#334155] hover:border-slate-400 transition-all duration-150 flex items-center justify-center gap-2.5 text-sm disabled:opacity-50"
         }
     };
 
     let biometric_btn_text = move || {
-        let action = if show_register.get() { "Sign Up" } else { "Log In" };
+        let action = if show_register.get() {
+            "Sign Up"
+        } else {
+            "Log In"
+        };
         match os_brand.get().as_str() {
             "Apple" => format!("{} with Apple Passkey", action),
             "Windows" => format!("{} with Windows Hello", action),
@@ -1515,12 +2056,18 @@ fn HomePage() -> impl IntoView {
         let params = query_map.get();
         if let Some(token) = params.get("token") {
             // Trigger login
-            login_trigger.dispatch(LoginViaMagicLink { token: token.clone() });
+            login_trigger.dispatch(LoginViaMagicLink {
+                token: token.clone(),
+            });
             // Clean token from browser URL without refresh
             #[cfg(feature = "hydrate")]
             {
                 if let Some(window) = web_sys::window() {
-                    let _ = window.history().expect("history").replace_state_with_url(&JsValue::NULL, "", Some("/"));
+                    let _ = window.history().expect("history").replace_state_with_url(
+                        &JsValue::NULL,
+                        "",
+                        Some("/"),
+                    );
                 }
             }
         }
@@ -1564,10 +2111,27 @@ fn HomePage() -> impl IntoView {
         ev.prevent_default();
         let email = email_input.get();
         if !email.is_empty() {
-            let uname = if show_register.get() { Some(username_input.get()) } else { None };
-            request_magic_action.dispatch(RequestMagicLink { email, username: uname });
+            let uname = if show_register.get() {
+                Some(username_input.get())
+            } else {
+                None
+            };
+            request_magic_action.dispatch(RequestMagicLink {
+                email,
+                username: uname,
+            });
         }
     };
+
+    // ----------------------------------------------------------------------------
+    // Password Authentication UI State Signals
+    // ----------------------------------------------------------------------------
+    let (active_tab, set_active_tab) = signal("password".to_string());
+    let (password_input, set_password_input) = signal(String::new());
+    let (show_local_links, set_show_local_links) = signal(false);
+    let (passkey_fallback_suggested, set_passkey_fallback_suggested) = signal(false);
+    let (password_auth_error, set_password_auth_error) = signal(Option::<String>::None);
+    let (password_auth_loading, set_password_auth_loading) = signal(false);
 
     // ----------------------------------------------------------------------------
     // WebAuthn Client Handlers
@@ -1598,7 +2162,9 @@ fn HomePage() -> impl IntoView {
                                 }
                             }
                             Err(e) => {
-                                let err_msg = e.as_string().unwrap_or_else(|| "User cancelled biometric prompts".to_string());
+                                let err_msg = e.as_string().unwrap_or_else(|| {
+                                    "User cancelled biometric prompts".to_string()
+                                });
                                 set_biometric_error.set(Some(err_msg));
                                 set_biometric_loading.set(false);
                             }
@@ -1620,59 +2186,76 @@ fn HomePage() -> impl IntoView {
 
     let handle_login_passkey = move || {
         let email = email_input.get();
-        // Allow empty email for discoverable credentials prompt
         set_biometric_loading.set(true);
         set_biometric_error.set(None);
+        set_passkey_fallback_suggested.set(false);
         leptos::task::spawn_local(async move {
+            let check_error = move |err_str: String| {
+                if err_str.contains("has no passkeys") {
+                    set_passkey_fallback_suggested.set(true);
+                } else {
+                    set_biometric_error.set(Some(err_str));
+                }
+            };
+
             match login_passkey_start(email).await {
                 Ok(resp) => {
                     #[cfg(feature = "hydrate")]
                     {
                         match resp {
-                            PasskeyStartResponse::Login { challenge_id, challenge_json } => {
-                                match loginPasskey(&challenge_json).await {
-                                    Ok(cred_js) => {
-                                        let cred_str = cred_js.as_string().unwrap();
-                                        match login_passkey_finish(challenge_id, cred_str).await {
-                                            Ok(_) => {
-                                                set_biometric_loading.set(false);
-                                                refresh_dashboard();
-                                            }
-                                            Err(e) => {
-                                                set_biometric_error.set(Some(e.to_string()));
-                                                set_biometric_loading.set(false);
-                                            }
+                            PasskeyStartResponse::Login {
+                                challenge_id,
+                                challenge_json,
+                            } => match loginPasskey(&challenge_json).await {
+                                Ok(cred_js) => {
+                                    let cred_str = cred_js.as_string().unwrap();
+                                    match login_passkey_finish(challenge_id, cred_str).await {
+                                        Ok(_) => {
+                                            set_biometric_loading.set(false);
+                                            refresh_dashboard();
+                                        }
+                                        Err(e) => {
+                                            check_error(e.to_string());
+                                            set_biometric_loading.set(false);
                                         }
                                     }
-                                    Err(e) => {
-                                        let err_msg = e.as_string().unwrap_or_else(|| "Biometric verification cancelled".to_string());
-                                        set_biometric_error.set(Some(err_msg));
-                                        set_biometric_loading.set(false);
-                                    }
                                 }
-                            }
-                            PasskeyStartResponse::Register { challenge_id, challenge_json, email: _ } => {
-                                match registerPasskey(&challenge_json).await {
-                                    Ok(cred_js) => {
-                                        let cred_str = cred_js.as_string().unwrap();
-                                        match register_passkey_finish_signup(challenge_id, cred_str).await {
-                                            Ok(_) => {
-                                                set_biometric_loading.set(false);
-                                                refresh_dashboard();
-                                            }
-                                            Err(e) => {
-                                                set_biometric_error.set(Some(e.to_string()));
-                                                set_biometric_loading.set(false);
-                                            }
+                                Err(e) => {
+                                    let err_msg = e.as_string().unwrap_or_else(|| {
+                                        "Biometric verification cancelled".to_string()
+                                    });
+                                    check_error(err_msg);
+                                    set_biometric_loading.set(false);
+                                }
+                            },
+                            PasskeyStartResponse::Register {
+                                challenge_id,
+                                challenge_json,
+                                email: _,
+                            } => match registerPasskey(&challenge_json).await {
+                                Ok(cred_js) => {
+                                    let cred_str = cred_js.as_string().unwrap();
+                                    match register_passkey_finish_signup(challenge_id, cred_str)
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            set_biometric_loading.set(false);
+                                            refresh_dashboard();
+                                        }
+                                        Err(e) => {
+                                            check_error(e.to_string());
+                                            set_biometric_loading.set(false);
                                         }
                                     }
-                                    Err(e) => {
-                                        let err_msg = e.as_string().unwrap_or_else(|| "Biometric signup cancelled".to_string());
-                                        set_biometric_error.set(Some(err_msg));
-                                        set_biometric_loading.set(false);
-                                    }
                                 }
-                            }
+                                Err(e) => {
+                                    let err_msg = e.as_string().unwrap_or_else(|| {
+                                        "Biometric signup cancelled".to_string()
+                                    });
+                                    check_error(err_msg);
+                                    set_biometric_loading.set(false);
+                                }
+                            },
                         }
                     }
                     #[cfg(not(feature = "hydrate"))]
@@ -1682,7 +2265,7 @@ fn HomePage() -> impl IntoView {
                     }
                 }
                 Err(e) => {
-                    set_biometric_error.set(Some(e.to_string()));
+                    check_error(e.to_string());
                     set_biometric_loading.set(false);
                 }
             }
@@ -1728,29 +2311,102 @@ fn HomePage() -> impl IntoView {
         });
     };
 
+    // ----------------------------------------------------------------------------
+    // Password Authentication Handlers
+    // ----------------------------------------------------------------------------
+
+    // Fetch local testing feature flag value
+    Effect::new(move |_| {
+        leptos::task::spawn_local(async move {
+            if let Ok(enabled) = check_local_testing_enabled().await {
+                set_show_local_links.set(enabled);
+            }
+        });
+    });
+
+    let switch_tab = move |tab: String| {
+        set_active_tab.set(tab);
+        set_biometric_error.set(None);
+        set_password_auth_error.set(None);
+        set_passkey_fallback_suggested.set(false);
+        request_magic_action.clear();
+    };
+
+    let handle_password_submit = move |ev: leptos::web_sys::SubmitEvent| {
+        ev.prevent_default();
+        let email = email_input.get();
+        let password = password_input.get();
+        let username = username_input.get();
+
+        if email.is_empty() || password.is_empty() {
+            return;
+        }
+
+        set_password_auth_loading.set(true);
+        set_password_auth_error.set(None);
+
+        leptos::task::spawn_local(async move {
+            if show_register.get() {
+                match register_with_password(email, username, password).await {
+                    Ok(user_info) => {
+                        println!("Registered and logged in with password: {:?}", user_info);
+                        set_password_auth_loading.set(false);
+                        refresh_dashboard();
+                    }
+                    Err(e) => {
+                        set_password_auth_error.set(Some(e.to_string()));
+                        set_password_auth_loading.set(false);
+                    }
+                }
+            } else {
+                match login_with_password(email, password).await {
+                    Ok(user_info) => {
+                        println!("Logged in with password: {:?}", user_info);
+                        set_password_auth_loading.set(false);
+                        refresh_dashboard();
+                    }
+                    Err(e) => {
+                        set_password_auth_error.set(Some(e.to_string()));
+                        set_password_auth_loading.set(false);
+                    }
+                }
+            }
+        });
+    };
+
     // Helper to render tree slots
     let get_slot_username = move |idx: usize| {
-        dashboard_data.get().matrix.map(|m| {
-            m.slots.get(idx)
-                .map(|s| s.username.clone())
-                .unwrap_or_else(|| "Empty".to_string())
-        }).unwrap_or_else(|| "Empty".to_string())
+        dashboard_data
+            .get()
+            .matrix
+            .map(|m| {
+                m.slots
+                    .get(idx)
+                    .map(|s| s.username.clone())
+                    .unwrap_or_else(|| "Empty".to_string())
+            })
+            .unwrap_or_else(|| "Empty".to_string())
     };
 
     let is_slot_filled = move |idx: usize| {
-        dashboard_data.get().matrix.map(|m| {
-            m.slots.get(idx)
-                .map(|s| s.username != "Empty")
-                .unwrap_or(false)
-        }).unwrap_or(false)
+        dashboard_data
+            .get()
+            .matrix
+            .map(|m| {
+                m.slots
+                    .get(idx)
+                    .map(|s| s.username != "Empty")
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
     };
 
     let is_slot_user = move |idx: usize| {
-        dashboard_data.get().matrix.map(|m| {
-            m.slots.get(idx)
-                .map(|s| s.is_user)
-                .unwrap_or(false)
-        }).unwrap_or(false)
+        dashboard_data
+            .get()
+            .matrix
+            .map(|m| m.slots.get(idx).map(|s| s.is_user).unwrap_or(false))
+            .unwrap_or(false)
     };
 
     view! {
@@ -1796,99 +2452,244 @@ fn HomePage() -> impl IntoView {
                                 {move || if show_register.get() { "Create Account" } else { "Welcome Back" }}
                             </h2>
                             <p class="text-sm text-slate-400">
-                                {move || if show_register.get() { "Register a new secure account via passwordless methods" } else { "Log in using a secure magic link or touch/face biometrics" }}
+                                {move || if show_register.get() { "Choose your preferred secure registration method" } else { "Log in using password, magic link, or biometric passkeys" }}
                             </p>
                         </div>
 
-                        // Form input
-                        <form on:submit=handle_magic_request class="space-y-4">
-                            <div class="space-y-1">
-                                <label class="text-xs font-medium text-slate-400 uppercase tracking-wider">"Email Address"</label>
-                                <input
-                                    type="email"
-                                    required
-                                    placeholder="name@example.com"
-                                    on:input=move |ev| set_email_input.set(event_target_value(&ev))
-                                    prop:value=email_input
-                                    class="w-full px-4 py-3 bg-[#0f172a] border border-[#1f2937] focus:border-[#00d4aa] rounded-xl text-white outline-none transition-all duration-150 text-sm focus:ring-1 focus:ring-[#00d4aa]"
-                                />
-                            </div>
+                        // Modern Glassmorphic Tab Switcher
+                        <div class="flex border border-[#1f2937] p-1 bg-[#0b0f19]/60 rounded-xl">
+                            <button
+                                type="button"
+                                on:click=move |_| switch_tab("password".to_string())
+                                class=move || {
+                                    let base = "flex-1 py-2 text-xs font-semibold rounded-lg transition-all duration-150 flex items-center justify-center gap-1.5 ";
+                                    if active_tab.get() == "password" {
+                                        format!("{base} bg-[#1f2937] text-white shadow-md border border-[#334155]")
+                                    } else {
+                                        format!("{base} text-slate-400 hover:text-white hover:bg-white/5")
+                                    }
+                                }
+                            >
+                                <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                                </svg>
+                                "Password"
+                            </button>
+                            <button
+                                type="button"
+                                on:click=move |_| switch_tab("magic".to_string())
+                                class=move || {
+                                    let base = "flex-1 py-2 text-xs font-semibold rounded-lg transition-all duration-150 flex items-center justify-center gap-1.5 ";
+                                    if active_tab.get() == "magic" {
+                                        format!("{base} bg-[#1f2937] text-white shadow-md border border-[#334155]")
+                                    } else {
+                                        format!("{base} text-slate-400 hover:text-white hover:bg-white/5")
+                                    }
+                                }
+                            >
+                                <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+                                </svg>
+                                "Magic Link"
+                            </button>
+                            <button
+                                type="button"
+                                on:click=move |_| switch_tab("passkey".to_string())
+                                class=move || {
+                                    let base = "flex-1 py-2 text-xs font-semibold rounded-lg transition-all duration-150 flex items-center justify-center gap-1.5 ";
+                                    if active_tab.get() == "passkey" {
+                                        format!("{base} bg-[#1f2937] text-white shadow-md border border-[#334155]")
+                                    } else {
+                                        format!("{base} text-slate-400 hover:text-white hover:bg-white/5")
+                                    }
+                                }
+                            >
+                                <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M2 12a10 10 0 1 0 18.8-4.3" />
+                                    <path d="M7 12a5 5 0 1 0 8.3-3.7" />
+                                    <path d="M12 12a2 2 0 1 0 3.8-1" />
+                                    <path d="M12 12v6" />
+                                </svg>
+                                "Passkeys"
+                            </button>
+                        </div>
 
-                            <Show when=move || show_register.get()>
-                                <div class="space-y-1 animate-fadeIn">
-                                    <label class="text-xs font-medium text-slate-400 uppercase tracking-wider">"Display Username"</label>
+                        // Conditional Tab Rendering
+                        <Show when=move || active_tab.get() == "password">
+                            <form on:submit=handle_password_submit class="space-y-4">
+                                <div class="space-y-1">
+                                    <label class="text-xs font-medium text-slate-400 uppercase tracking-wider">"Email Address"</label>
                                     <input
-                                        type="text"
+                                        type="email"
                                         required
-                                        placeholder="Alice"
-                                        on:input=move |ev| set_username_input.set(event_target_value(&ev))
-                                        prop:value=username_input
+                                        placeholder="name@example.com"
+                                        on:input=move |ev| set_email_input.set(event_target_value(&ev))
+                                        prop:value=email_input
                                         class="w-full px-4 py-3 bg-[#0f172a] border border-[#1f2937] focus:border-[#00d4aa] rounded-xl text-white outline-none transition-all duration-150 text-sm focus:ring-1 focus:ring-[#00d4aa]"
                                     />
                                 </div>
-                            </Show>
 
-                            // Submit Magic Link Button
-                            <button
-                                type="submit"
-                                class="w-full py-3 bg-gradient-to-r from-[#00d4aa] to-teal-500 hover:from-[#00c29b] hover:to-teal-600 text-[#0b0f19] font-semibold rounded-xl shadow-lg shadow-[#00d4aa]/10 hover:shadow-[#00d4aa]/20 transform hover:-translate-y-0.5 active:translate-y-0 transition-all duration-150 text-sm"
-                            >
-                                {move || if show_register.get() { "Send Registration Link" } else { "Send Magic Login Link" }}
-                            </button>
-                        </form>
+                                <Show when=move || show_register.get()>
+                                    <div class="space-y-1 animate-fadeIn">
+                                        <label class="text-xs font-medium text-slate-400 uppercase tracking-wider">"Display Username"</label>
+                                        <input
+                                            type="text"
+                                            required
+                                            placeholder="Alice"
+                                            on:input=move |ev| set_username_input.set(event_target_value(&ev))
+                                            prop:value=username_input
+                                            class="w-full px-4 py-3 bg-[#0f172a] border border-[#1f2937] focus:border-[#00d4aa] rounded-xl text-white outline-none transition-all duration-150 text-sm focus:ring-1 focus:ring-[#00d4aa]"
+                                        />
+                                    </div>
+                                </Show>
 
-                        // Biometrics Login/Signup Button
-                        <div class="relative flex items-center justify-center">
-                            <div class="border-t border-[#1f2937] w-full absolute"></div>
-                            <span class="bg-[#111827] px-3 text-xs text-slate-500 uppercase tracking-wider relative z-10">"or biometric passkey"</span>
-                        </div>
-
-                        <button
-                            type="button"
-                            on:click=move |_| handle_login_passkey()
-                            disabled=biometric_loading
-                            class=biometric_btn_class
-                        >
-                            <Show
-                                when=move || os_brand.get() == "Apple"
-                            >
-                                <svg class="w-4 h-4 fill-current" viewBox="0 0 170 170">
-                                    <path d="M150.37 130.25c-2.45 5.66-5.35 10.87-8.71 15.66-4.58 6.53-8.33 11.05-11.22 13.56-4.48 4.12-9.28 6.23-14.42 6.35-3.69 0-8.14-1.05-13.32-3.18-5.19-2.12-9.97-3.17-14.34-3.17-4.58 0-9.49 1.05-14.75 3.17-5.26 2.13-9.5 3.24-12.74 3.35-4.37.13-9.13-1.9-14.29-6.1-3.48-2.84-7.44-7.78-11.89-14.83C21.6 122.5 13.43 97.45 13.43 69.57c0-18.06 4.96-33.1 14.89-45.1 9.93-12.02 22.09-18.12 36.5-18.3 6.1-.06 13.25 2.18 21.43 6.7 8.18 4.54 13.53 6.8 16.03 6.8 2.25 0 7.42-2.22 15.53-6.66 8.11-4.43 14.99-6.57 20.63-6.4 15.08.3 26.6 5.84 34.56 16.63-14.4 8.7-21.49 20.9-21.3 36.63.2 12.06 4.7 22.06 13.5 30.02 8.8 7.96 19.34 12.24 31.62 12.83-2.58 7.6-5.83 15.6-9.74 24.03zM119.22 25.13c0-8.24 2.89-15.82 8.68-22.73 7.37-8.62 16.48-13.25 26.17-12.4 1 8.58-1.98 16.5-7.9 23.36-6.07 7.02-14.9 11.23-23.77 11.77-1.12-8.38-3.18-11.77-3.18-11.77z"/>
-                                </svg>
-                            </Show>
-                            <Show
-                                when=move || os_brand.get() == "Windows"
-                            >
-                                <svg class="w-4 h-4 fill-current" viewBox="0 0 24 24">
-                                    <path d="M0 3.449L9.75 2.1v9.45H0V3.449zM0 12.45h9.75v9.45L0 20.551v-8.1zM10.8 1.95L24 0v11.55H10.8V1.95zM10.8 12.45H24v11.55l-13.2-1.95v-9.6z"/>
-                                </svg>
-                            </Show>
-                            <Show
-                                when=move || os_brand.get() != "Apple" && os_brand.get() != "Windows"
-                            >
-                                <svg class="w-4 h-4 fill-current" viewBox="0 0 24 24">
-                                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17h-2v-2h2v2zm2.07-7.75l-1.41 1.41C12.54 13.78 12 14.83 12 16h-2c0-1.72.69-3.28 1.81-4.4l1.41-1.41C13.72 9.72 14 9.13 14 8.5c0-1.1-.9-2-2-2s-2 .9-2 2H6c0-3.31 2.69-6 6-6s6 2.69 6 6c0 1.25-.5 2.43-1.93 3.25z"/>
-                                </svg>
-                            </Show>
-                            {biometric_btn_text}
-                        </button>
-
-                        // Response Messages
-                        <div class="text-center space-y-2">
-                            <Show when=move || request_magic_action.pending().get() || login_trigger.pending().get()>
-                                <div class="flex items-center justify-center gap-2 text-xs text-teal-400">
-                                    <div class="w-3 h-3 border-2 border-transparent border-t-teal-400 rounded-full animate-spin"></div>
-                                    "Processing request..."
+                                <div class="space-y-1">
+                                    <label class="text-xs font-medium text-slate-400 uppercase tracking-wider">"Password"</label>
+                                    <input
+                                        type="password"
+                                        required
+                                        placeholder="••••••••"
+                                        on:input=move |ev| set_password_input.set(event_target_value(&ev))
+                                        prop:value=password_input
+                                        class="w-full px-4 py-3 bg-[#0f172a] border border-[#1f2937] focus:border-[#00d4aa] rounded-xl text-white outline-none transition-all duration-150 text-sm focus:ring-1 focus:ring-[#00d4aa]"
+                                    />
                                 </div>
-                            </Show>
 
-                            <Show when=move || request_magic_action.value().get().is_some()>
-                                <div class="p-3 bg-teal-950/50 border border-teal-800 text-teal-400 rounded-xl text-xs text-left leading-relaxed">
+                                <button
+                                    type="submit"
+                                    disabled=move || password_auth_loading.get()
+                                    class="w-full py-3 bg-gradient-to-r from-[#00d4aa] to-teal-500 hover:from-[#00c29b] hover:to-teal-600 text-[#0b0f19] font-semibold rounded-xl shadow-lg shadow-[#00d4aa]/10 hover:shadow-[#00d4aa]/20 transform hover:-translate-y-0.5 active:translate-y-0 transition-all duration-150 text-sm flex items-center justify-center gap-2"
+                                >
+                                    <Show when=move || password_auth_loading.get()>
+                                        <div class="w-3.5 h-3.5 border-2 border-transparent border-t-[#0b0f19] rounded-full animate-spin"></div>
+                                    </Show>
+                                    {move || if show_register.get() { "Create Account & Sign In" } else { "Log In with Password" }}
+                                </button>
+
+                                <div class="text-center pt-2">
+                                    <button
+                                        type="button"
+                                        on:click=move |_| {
+                                            set_show_register.update(|v| *v = !*v);
+                                            set_password_auth_error.set(None);
+                                        }
+                                        class="text-xs text-slate-400 hover:text-[#00d4aa] transition-colors"
+                                    >
+                                        {move || if show_register.get() { "Already have an account? Log In" } else { "Don't have an account? Sign Up" }}
+                                    </button>
+                                </div>
+                            </form>
+                        </Show>
+
+                        <Show when=move || active_tab.get() == "magic">
+                            <form on:submit=handle_magic_request class="space-y-4">
+                                <div class="space-y-1">
+                                    <label class="text-xs font-medium text-slate-400 uppercase tracking-wider">"Email Address"</label>
+                                    <input
+                                        type="email"
+                                        required
+                                        placeholder="name@example.com"
+                                        on:input=move |ev| set_email_input.set(event_target_value(&ev))
+                                        prop:value=email_input
+                                        class="w-full px-4 py-3 bg-[#0f172a] border border-[#1f2937] focus:border-[#00d4aa] rounded-xl text-white outline-none transition-all duration-150 text-sm focus:ring-1 focus:ring-[#00d4aa]"
+                                    />
+                                </div>
+
+                                <Show when=move || show_register.get()>
+                                    <div class="space-y-1 animate-fadeIn">
+                                        <label class="text-xs font-medium text-slate-400 uppercase tracking-wider">"Display Username"</label>
+                                        <input
+                                            type="text"
+                                            required
+                                            placeholder="Alice"
+                                            on:input=move |ev| set_username_input.set(event_target_value(&ev))
+                                            prop:value=username_input
+                                            class="w-full px-4 py-3 bg-[#0f172a] border border-[#1f2937] focus:border-[#00d4aa] rounded-xl text-white outline-none transition-all duration-150 text-sm focus:ring-1 focus:ring-[#00d4aa]"
+                                        />
+                                    </div>
+                                </Show>
+
+                                <button
+                                    type="submit"
+                                    class="w-full py-3 bg-gradient-to-r from-[#00d4aa] to-teal-500 hover:from-[#00c29b] hover:to-teal-600 text-[#0b0f19] font-semibold rounded-xl shadow-lg shadow-[#00d4aa]/10 hover:shadow-[#00d4aa]/20 transform hover:-translate-y-0.5 active:translate-y-0 transition-all duration-150 text-sm flex items-center justify-center gap-2"
+                                >
+                                    <Show when=move || request_magic_action.pending().get()>
+                                        <div class="w-3.5 h-3.5 border-2 border-transparent border-t-[#0b0f19] rounded-full animate-spin"></div>
+                                    </Show>
+                                    {move || if show_register.get() { "Send Registration Link" } else { "Send Magic Login Link" }}
+                                </button>
+
+                                <div class="text-center pt-2">
+                                    <button
+                                        type="button"
+                                        on:click=move |_| {
+                                            set_show_register.update(|v| *v = !*v);
+                                            request_magic_action.clear();
+                                        }
+                                        class="text-xs text-slate-400 hover:text-[#00d4aa] transition-colors"
+                                    >
+                                        {move || if show_register.get() { "Already have an account? Log In" } else { "Don't have an account? Sign Up" }}
+                                    </button>
+                                </div>
+                            </form>
+                        </Show>
+
+                        <Show when=move || active_tab.get() == "passkey">
+                            <div class="space-y-4">
+                                <div class="space-y-1">
+                                    <label class="text-xs font-medium text-slate-400 uppercase tracking-wider">"Email Address (Optional)"</label>
+                                    <input
+                                        type="email"
+                                        placeholder="name@example.com"
+                                        on:input=move |ev| set_email_input.set(event_target_value(&ev))
+                                        prop:value=email_input
+                                        class="w-full px-4 py-3 bg-[#0f172a] border border-[#1f2937] focus:border-[#00d4aa] rounded-xl text-white outline-none transition-all duration-150 text-sm focus:ring-1 focus:ring-[#00d4aa]"
+                                    />
+                                    <p class="text-[10px] text-slate-500">"Leave empty if you have logged in on this device before."</p>
+                                </div>
+
+                                <button
+                                    type="button"
+                                    on:click=move |_| handle_login_passkey()
+                                    disabled=move || biometric_loading.get()
+                                    class=biometric_btn_class
+                                >
+                                    <Show when=move || biometric_loading.get()>
+                                        <div class="w-3.5 h-3.5 border-2 border-transparent border-t-current rounded-full animate-spin mr-2"></div>
+                                    </Show>
+                                    <Show when=move || os_brand.get() == "Apple">
+                                        <svg class="w-4 h-4 fill-current mr-2" viewBox="0 0 24 24">
+                                            <path d="M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1.183-4.961 3.014-2.117 3.675-.546 9.103 1.519 12.09 1.013 1.454 2.208 3.09 3.792 3.039 1.52-.065 2.09-.987 3.935-.987 1.831 0 2.35.987 3.96.948 1.637-.026 2.676-1.48 3.676-2.948 1.156-1.688 1.636-3.325 1.662-3.415-.039-.013-3.182-1.221-3.22-4.857-.026-3.04 2.48-4.494 2.597-4.559-1.429-2.09-3.623-2.324-4.39-2.376-2-.156-3.675 1.09-4.61 1.09zM15.53 3.83c.843-1.012 1.4-2.427 1.245-3.83-1.207.052-2.662.805-3.532 1.818-.78.896-1.454 2.338-1.273 3.714 1.338.104 2.715-.688 3.559-1.701"/>
+                                        </svg>
+                                    </Show>
+                                    <Show when=move || os_brand.get() == "Windows">
+                                        <svg class="w-4 h-4 fill-current mr-2" viewBox="0 0 24 24">
+                                            <path d="M0 0h11v11H0zm13 0h11v11H13zM0 13h11v11H0zm13 0h11v11H13z"/>
+                                        </svg>
+                                    </Show>
+                                    <Show when=move || os_brand.get() != "Apple" && os_brand.get() != "Windows">
+                                        <svg class="w-4 h-4 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M2 12a10 10 0 1 0 18.8-4.3" />
+                                            <path d="M7 12a5 5 0 1 0 8.3-3.7" />
+                                            <path d="M12 12a2 2 0 1 0 3.8-1" />
+                                            <path d="M12 12v6" />
+                                        </svg>
+                                    </Show>
+                                    {biometric_btn_text}
+                                </button>
+                            </div>
+                        </Show>
+
+                        // Status & Error Messages (unified for all tabs)
+                        <div class="space-y-3 pt-2">
+                            // Magic Link Response
+                            <Show when=move || show_local_links.get() && request_magic_action.value().get().is_some()>
+                                <div class="p-3 bg-teal-950/50 border border-teal-800 text-teal-400 rounded-xl text-xs text-left leading-relaxed animate-fadeIn">
                                     <p class="font-bold mb-1">"Link Generated!"</p>
                                     "For local testing, click: "
                                     <a
                                         href=move || format!("/?token={}", request_magic_action.value().get().unwrap().unwrap())
-                                        class="underline hover:text-white break-all"
+                                        class="underline hover:text-white break-all font-mono"
                                     >
                                         {move || {
                                             let token = request_magic_action.value().get().unwrap().unwrap();
@@ -1904,25 +2705,48 @@ fn HomePage() -> impl IntoView {
                                 </div>
                             </Show>
 
-                            <Show when=move || biometric_error.get().is_some()>
-                                <p class="text-xs text-red-400 bg-red-950/30 p-3 border border-red-900 rounded-xl">
-                                    {move || biometric_error.get().unwrap()}
-                                </p>
+                            // Password Error
+                            <Show when=move || password_auth_error.get().is_some() && active_tab.get() == "password">
+                                <div class="p-3 bg-red-950/30 border border-red-900 text-red-400 rounded-xl text-xs text-left leading-relaxed">
+                                    {move || password_auth_error.get().unwrap()}
+                                </div>
                             </Show>
-                        </div>
 
-                        // Toggle Register Link
-                        <div class="text-center pt-2">
-                            <button
-                                on:click=move |_| {
-                                    set_show_register.update(|v| *v = !*v);
-                                    request_magic_action.clear();
-                                    set_biometric_error.set(None);
-                                }
-                                class="text-xs text-slate-400 hover:text-[#00d4aa] transition-colors"
-                            >
-                                {move || if show_register.get() { "Already have an account? Log In" } else { "Don't have an account? Sign Up" }}
-                            </button>
+                            // Biometric Error
+                            <Show when=move || biometric_error.get().is_some() && active_tab.get() == "passkey">
+                                <div class="p-3 bg-red-950/30 border border-red-900 text-red-400 rounded-xl text-xs text-left leading-relaxed">
+                                    {move || biometric_error.get().unwrap()}
+                                </div>
+                            </Show>
+
+                            // Biometric Fallback Suggestion Block
+                            <Show when=move || passkey_fallback_suggested.get() && active_tab.get() == "passkey">
+                                <div class="p-4 bg-amber-950/40 border border-amber-800 rounded-xl text-left space-y-3 animate-fadeIn">
+                                    <div class="flex gap-2.5 items-start">
+                                        <svg class="w-5 h-5 text-amber-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                            <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                                        </svg>
+                                        <div>
+                                            <p class="text-xs font-bold text-amber-200">"No Passkeys Enrolled"</p>
+                                            <p class="text-xs text-amber-400 mt-0.5 leading-relaxed">
+                                                "This account is registered but has no passkeys on this device yet. Log in via Magic Link first, then register your device in Settings."
+                                            </p>
+                                        </div>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        on:click=move |_| {
+                                            switch_tab("magic".to_string());
+                                        }
+                                        class="w-full py-2 bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold rounded-lg transition-all duration-150 flex items-center justify-center gap-1 shadow-md shadow-amber-950/30"
+                                    >
+                                        "Switch to Magic Link Login"
+                                        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                            <path stroke-linecap="round" stroke-linejoin="round" d="M14 5l7 7m0 0l-7 7m7-7H3" />
+                                        </svg>
+                                    </button>
+                                </div>
+                            </Show>
                         </div>
                     </div>
                 </div>
@@ -1936,7 +2760,7 @@ fn HomePage() -> impl IntoView {
                         // Profile & Referral Card
                         <div class="bg-[#111827] border border-[#1f2937] rounded-2xl p-6 space-y-4">
                             <h3 class="text-lg font-bold text-white">"Card Progress & Referral Status"</h3>
-                            
+
                             <div class="space-y-3">
                                 <div>
                                     <label class="text-[10px] uppercase tracking-wider text-slate-400">"Account ID"</label>
@@ -2028,7 +2852,7 @@ fn HomePage() -> impl IntoView {
                                     />
                                     <button
                                         on:click=move |_| handle_award_points()
-                                        disabled=award_loading
+                                        disabled=move || award_loading.get()
                                         class="flex-1 py-2 bg-[#00d4aa] hover:bg-[#00c29b] text-[#0b0f19] font-semibold text-sm rounded-lg transition-all duration-150 flex items-center justify-center gap-1"
                                     >
                                         <Show when=move || award_loading.get()>
@@ -2049,17 +2873,51 @@ fn HomePage() -> impl IntoView {
                             <p class="text-xs text-slate-400 leading-relaxed">
                                 "Register your Apple Touch ID, Face ID, or Windows Hello biometrics to log in securely next time without needing email link lookups."
                             </p>
-                            
-                            <button
-                                on:click=move |_| handle_register_passkey()
-                                disabled=biometric_loading
-                                class="w-full py-2 bg-gradient-to-r from-teal-500 to-[#00d4aa] text-[#0b0f19] font-bold text-xs rounded-lg shadow-md shadow-[#00d4aa]/10 hover:shadow-[#00d4aa]/20 transition-all duration-150 flex items-center justify-center gap-1"
+
+                            <Show
+                                when=move || {
+                                    dashboard_data.get().user.as_ref().map(|u| u.has_passkey).unwrap_or(false)
+                                }
+                                fallback=move || view! {
+                                    <button
+                                        on:click=move |_| handle_register_passkey()
+                                        disabled=move || biometric_loading.get()
+                                        class="w-full py-2 bg-gradient-to-r from-teal-500 to-[#00d4aa] text-[#0b0f19] font-bold text-xs rounded-lg shadow-md shadow-[#00d4aa]/10 hover:shadow-[#00d4aa]/20 transition-all duration-150 flex items-center justify-center gap-1"
+                                    >
+                                        <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                                            <path d="M12 2c5.522 0 10 4.477 10 10s-4.478 10-10 10S2 17.523 2 12 6.478 2 12 2zm1 10h3v-2h-3V7h-2v3H8v2h3v3h2v-3z"/>
+                                        </svg>
+                                        "Enroll Biometric Passkey"
+                                    </button>
+                                }
                             >
-                                <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                                    <path d="M12 2c5.522 0 10 4.477 10 10s-4.478 10-10 10S2 17.523 2 12 6.478 2 12 2zm1 10h3v-2h-3V7h-2v3H8v2h3v3h2v-3z"/>
-                                </svg>
-                                "Enroll Biometric Passkey"
-                            </button>
+                                <div class="p-4 bg-emerald-950/40 border border-emerald-800 rounded-xl text-left space-y-3 animate-fadeIn">
+                                    <div class="flex gap-2.5 items-center text-emerald-400">
+                                        <svg class="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                            <path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                                        </svg>
+                                        <div>
+                                            <p class="text-xs font-bold text-emerald-200">"Biometric Passkey Active"</p>
+                                            <p class="text-[10px] text-emerald-400 mt-0.5 leading-relaxed">
+                                                "Your account is secured with Touch ID, Face ID, or Windows Hello biometrics."
+                                            </p>
+                                        </div>
+                                    </div>
+                                    <button
+                                        on:click=move |_| handle_register_passkey()
+                                        disabled=move || biometric_loading.get()
+                                        class="w-full py-1.5 bg-emerald-900/30 hover:bg-emerald-900/50 border border-emerald-700/50 hover:border-emerald-600 text-emerald-200 font-semibold text-[10px] rounded-lg transition-all duration-150 flex items-center justify-center gap-1"
+                                    >
+                                        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M2 12a10 10 0 1 0 18.8-4.3" />
+                                            <path d="M7 12a5 5 0 1 0 8.3-3.7" />
+                                            <path d="M12 12a2 2 0 1 0 3.8-1" />
+                                            <path d="M12 12v6" />
+                                        </svg>
+                                        "Register Additional Device"
+                                    </button>
+                                </div>
+                            </Show>
 
                             <Show when=move || biometric_error.get().is_some()>
                                 <p class="text-xs text-red-400 bg-red-950/30 p-2 border border-red-900 rounded-lg">
