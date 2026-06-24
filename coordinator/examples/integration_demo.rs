@@ -170,7 +170,11 @@ async fn main() {
 
     // 2. Startup Daemon Worker Task
     println!("Starting orchestrator background daemon worker...");
-    let daemon_handle = tokio::spawn(start_orchestrator_daemon(aggregator.clone(), pool.clone()));
+    let daemon_handle = tokio::spawn(start_orchestrator_daemon(
+        aggregator.clone(),
+        pool.clone(),
+        100,
+    ));
 
     // 3. Simulate Client Requests
     let user_id = Uuid::now_v7();

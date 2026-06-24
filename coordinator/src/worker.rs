@@ -1,117 +1,104 @@
+//! Daemon worker for polling transactional outboxes and driving the saga aggregator.
+
 use crate::PgAccountAggregator;
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
-#[derive(Debug, Clone)]
-pub struct OutboxEvent {
-    pub id: Uuid,
-    pub account_id: Uuid,
-    pub matrix_id: Option<Uuid>,
-}
-
-pub async fn start_orchestrator_daemon(aggregator: Arc<PgAccountAggregator>, pool: PgPool) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+/// Start a polling loop daemon in a background tokio task.
+pub async fn start_orchestrator_daemon(
+    aggregator: Arc<PgAccountAggregator>,
+    pool: PgPool,
+    poll_interval_ms: u64,
+) {
+    let mut interval = tokio::time::interval(Duration::from_millis(poll_interval_ms));
     loop {
         interval.tick().await;
 
-        // 1. Process Matrix Cycled Events
-        if let Ok(events) = fetch_matrix_outbox(&pool).await {
-            for event in events {
-                if let Some(matrix_id) = event.matrix_id {
-                    match aggregator
-                        .handle_matrix_cycled(event.id, event.account_id, matrix_id)
-                        .await
-                    {
-                        Ok(_) => {
-                            let _ = mark_matrix_event_processed(&pool, event.id).await;
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "Error coordinating MatrixCycled event {}: {:?}",
-                                event.id, e
-                            );
-                        }
-                    }
-                }
-            }
+        // 1. Poll and process matrix outbox events
+        if let Err(e) = process_matrix_outbox_events(&aggregator, &pool).await {
+            eprintln!("Error processing matrix outbox events: {:?}", e);
         }
 
-        // 2. Process Flushline Graduated Events
-        if let Ok(events) = fetch_flushline_outbox(&pool).await {
-            for event in events {
-                match aggregator
-                    .handle_flushline_graduated(event.id, event.account_id)
-                    .await
-                {
-                    Ok(_) => {
-                        let _ = mark_flushline_event_processed(&pool, event.id).await;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "Error coordinating FlushlineGraduated event {}: {:?}",
-                            event.id, e
-                        );
-                    }
-                }
-            }
+        // 2. Poll and process flushline outbox events
+        if let Err(e) = process_flushline_outbox_events(&aggregator, &pool).await {
+            eprintln!("Error processing flushline outbox events: {:?}", e);
         }
     }
 }
 
-pub async fn fetch_matrix_outbox(pool: &PgPool) -> Result<Vec<OutboxEvent>, sqlx::Error> {
+async fn process_matrix_outbox_events(
+    aggregator: &PgAccountAggregator,
+    pool: &PgPool,
+) -> Result<(), sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT event_id, account_id, matrix_id FROM matrix_outbox WHERE processed = FALSE ORDER BY created_at ASC"
+        "SELECT event_id, account_id, matrix_id FROM matrix_outbox \
+         WHERE processed = FALSE ORDER BY created_at ASC LIMIT 50",
     )
     .fetch_all(pool)
     .await?;
 
-    let events = rows
-        .into_iter()
-        .map(|row| OutboxEvent {
-            id: row.get("event_id"),
-            account_id: row.get("account_id"),
-            matrix_id: Some(row.get("matrix_id")),
-        })
-        .collect();
+    for row in rows {
+        let event_id: Uuid = row.get("event_id");
+        let account_id: Uuid = row.get("account_id");
+        let matrix_id: Uuid = row.get("matrix_id");
 
-    Ok(events)
-}
+        match aggregator
+            .handle_matrix_cycled(event_id, account_id, matrix_id)
+            .await
+        {
+            Ok(_) => {
+                sqlx::query("UPDATE matrix_outbox SET processed = TRUE WHERE event_id = $1")
+                    .bind(event_id)
+                    .execute(pool)
+                    .await?;
+            }
+            Err(e) => {
+                eprintln!(
+                    "Aggregator daemon matrix cycled coordination failed for event {}: {:?}",
+                    event_id, e
+                );
+            }
+        }
+    }
 
-pub async fn mark_matrix_event_processed(pool: &PgPool, event_id: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE matrix_outbox SET processed = TRUE WHERE event_id = $1")
-        .bind(event_id)
-        .execute(pool)
-        .await?;
     Ok(())
 }
 
-pub async fn fetch_flushline_outbox(pool: &PgPool) -> Result<Vec<OutboxEvent>, sqlx::Error> {
+async fn process_flushline_outbox_events(
+    aggregator: &PgAccountAggregator,
+    pool: &PgPool,
+) -> Result<(), sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT event_id, account_id FROM flushline_outbox WHERE processed = FALSE ORDER BY created_at ASC"
+        "SELECT event_id, account_id FROM flushline_outbox \
+         WHERE processed = FALSE ORDER BY created_at ASC LIMIT 50",
     )
     .fetch_all(pool)
     .await?;
 
-    let events = rows
-        .into_iter()
-        .map(|row| OutboxEvent {
-            id: row.get("event_id"),
-            account_id: row.get("account_id"),
-            matrix_id: None,
-        })
-        .collect();
+    for row in rows {
+        let event_id: Uuid = row.get("event_id");
+        let account_id: Uuid = row.get("account_id");
 
-    Ok(events)
-}
+        match aggregator
+            .handle_flushline_graduated(event_id, account_id)
+            .await
+        {
+            Ok(_) => {
+                sqlx::query("UPDATE flushline_outbox SET processed = TRUE WHERE event_id = $1")
+                    .bind(event_id)
+                    .execute(pool)
+                    .await?;
+            }
+            Err(e) => {
+                eprintln!(
+                    "Aggregator daemon flushline graduated coordination failed for event {}: {:?}",
+                    event_id, e
+                );
+            }
+        }
+    }
 
-pub async fn mark_flushline_event_processed(
-    pool: &PgPool,
-    event_id: Uuid,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE flushline_outbox SET processed = TRUE WHERE event_id = $1")
-        .bind(event_id)
-        .execute(pool)
-        .await?;
     Ok(())
 }
