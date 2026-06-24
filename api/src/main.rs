@@ -34,6 +34,9 @@ async fn handle_404() -> impl IntoResponse {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load environment variables from .env file if present
+    let _ = dotenvy::dotenv();
+
     // Initialize logging
     tracing_subscriber::registry()
         .with(

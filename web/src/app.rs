@@ -393,6 +393,7 @@ pub async fn request_magic_link(
         use crate::rfn_store::{MagicLinkRecord, get_state, save_state};
         use chrono::Duration;
         use rand::{Rng, distributions::Alphanumeric};
+        use http_body_util::BodyExt;
 
         ssr_helpers::check_rate_limit()?;
 
@@ -404,53 +405,56 @@ pub async fn request_magic_link(
         }
 
         let state_store = get_state();
-        let mut state = state_store.write().unwrap();
+        let token = {
+            let mut state = state_store.write().unwrap();
 
-        // 1. Verify or create user structure
-        let _user_id = state
-            .users
-            .iter()
-            .find(|(_, u)| u.email == email)
-            .map(|(id, _)| *id)
-            .unwrap_or_else(|| {
-                let id = Uuid::new_v4();
-                let display_username = username
-                    .clone()
-                    .unwrap_or_else(|| email.split('@').next().unwrap_or("user").to_string());
+            // 1. Verify or create user structure
+            let _user_id = state
+                .users
+                .iter()
+                .find(|(_, u)| u.email == email)
+                .map(|(id, _)| *id)
+                .unwrap_or_else(|| {
+                    let id = Uuid::new_v4();
+                    let display_username = username
+                        .clone()
+                        .unwrap_or_else(|| email.split('@').next().unwrap_or("user").to_string());
 
-                state.users.insert(
-                    id,
-                    crate::rfn_store::User {
+                    state.users.insert(
                         id,
-                        email: email.clone(),
-                        username: display_username,
-                        role: "user".to_string(),
-                        created_at: Utc::now(),
-                        password_hash: None,
-                    },
-                );
-                id
-            });
+                        crate::rfn_store::User {
+                            id,
+                            email: email.clone(),
+                            username: display_username,
+                            role: "user".to_string(),
+                            created_at: Utc::now(),
+                            password_hash: None,
+                        },
+                    );
+                    id
+                });
 
-        // 2. Generate secure token
-        let token: String = rand::thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(32)
-            .map(char::from)
-            .collect();
+            // 2. Generate secure token
+            let token: String = rand::thread_rng()
+                .sample_iter(&Alphanumeric)
+                .take(32)
+                .map(char::from)
+                .collect();
 
-        let expires_at = Utc::now() + Duration::minutes(15);
-        state.magic_links.insert(
-            token.clone(),
-            MagicLinkRecord {
-                token: token.clone(),
-                email,
-                expires_at,
-                used: false,
-            },
-        );
+            let expires_at = Utc::now() + Duration::minutes(15);
+            state.magic_links.insert(
+                token.clone(),
+                MagicLinkRecord {
+                    token: token.clone(),
+                    email: email.clone(),
+                    expires_at,
+                    used: false,
+                },
+            );
 
-        save_state(&state);
+            save_state(&state);
+            token
+        };
 
         let parts = use_context::<http::request::Parts>();
         let host = parts
@@ -459,10 +463,70 @@ pub async fn request_magic_link(
             .and_then(|h| h.to_str().ok())
             .unwrap_or("localhost:4000");
 
-        println!(
-            "MOCK EMAIL: Magic link requested. URL: http://{}/?token={}",
-            host, token
-        );
+        if let Ok(api_key) = std::env::var("RESEND_API_KEY") {
+            if !api_key.trim().is_empty() {
+                let sender = std::env::var("RESEND_SENDER")
+                    .unwrap_or_else(|_| "onboarding@resend.dev".to_string());
+
+                let magic_url = format!("http://{}/?token={}", host, token);
+
+                let body_json = serde_json::json!({
+                    "from": sender,
+                    "to": [email.clone()],
+                    "subject": "Log in to MaxPayout",
+                    "html": format!(
+                        "<p>Click the link below to log in to your MaxPayout account:</p><p><a href=\"{}\">Log In Now</a></p>",
+                        magic_url
+                    )
+                });
+
+                let body_str = body_json.to_string();
+
+                let req = http::Request::builder()
+                    .method("POST")
+                    .uri("https://api.resend.com/emails")
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .header("Content-Type", "application/json")
+                    .body(body_str)
+                    .map_err(|e| {
+                        ServerFnError::ServerError(format!("Failed to build request: {}", e))
+                    })?;
+
+                // Send the request using spin_sdk::http::send
+                let resp = spin_sdk::http::send(req).await.map_err(|e| {
+                    ServerFnError::ServerError(format!("Failed to send email via Resend: {:?}", e))
+                })?;
+
+                if resp.status().is_success() {
+                    println!("Successfully sent magic link email to {} via Resend", email);
+                } else {
+                    let status = resp.status();
+                    let body_collected = resp.into_body().collect().await.map_err(|e| {
+                        ServerFnError::ServerError(format!("Failed to read response body from Resend: {:?}", e))
+                    })?;
+                    let body_bytes = body_collected.to_bytes();
+                    let body_str = String::from_utf8_lossy(&body_bytes).to_string();
+                    eprintln!(
+                        "Failed to send email via Resend (Status: {}): {}",
+                        status, body_str
+                    );
+                    return Err(ServerFnError::ServerError(format!(
+                        "Failed to send email via Resend (Status: {}): {}",
+                        status, body_str
+                    )));
+                }
+            } else {
+                println!(
+                    "MOCK EMAIL: Magic link requested. URL: http://{}/?token={}",
+                    host, token
+                );
+            }
+        } else {
+            println!(
+                "MOCK EMAIL: Magic link requested. URL: http://{}/?token={}",
+                host, token
+            );
+        }
         Ok(token)
     }
     #[cfg(not(feature = "ssr"))]
@@ -641,6 +705,26 @@ pub async fn check_local_testing_enabled() -> Result<bool, ServerFnError<String>
         Ok(std::env::var("SHOW_LOCAL_TESTING_LINKS")
             .map(|val| val == "true" || val == "1")
             .unwrap_or(false))
+    }
+    #[cfg(not(feature = "ssr"))]
+    {
+        Err(ServerFnError::ServerError(
+            "SSR feature not enabled".to_string(),
+        ))
+    }
+}
+
+#[server(prefix = "/api")]
+pub async fn check_magic_link_enabled() -> Result<bool, ServerFnError<String>> {
+    #[cfg(feature = "ssr")]
+    {
+        let has_resend = std::env::var("RESEND_API_KEY")
+            .map(|val| !val.trim().is_empty())
+            .unwrap_or(false);
+        let local_testing = std::env::var("SHOW_LOCAL_TESTING_LINKS")
+            .map(|val| val == "true" || val == "1")
+            .unwrap_or(false);
+        Ok(has_resend || local_testing)
     }
     #[cfg(not(feature = "ssr"))]
     {
@@ -1984,19 +2068,6 @@ pub fn App() -> impl IntoView {
     }
 }
 
-fn clean_server_error<T: std::fmt::Display>(err: ServerFnError<T>) -> String {
-    match err {
-        ServerFnError::ServerError(msg) => msg.to_string(),
-        ServerFnError::Deserialization(msg) => format!("Failed to parse response: {}", msg),
-        ServerFnError::Serialization(msg) => format!("Failed to serialize arguments: {}", msg),
-        ServerFnError::Request(msg) => format!("Request failed: {}", msg),
-        ServerFnError::Response(msg) => format!("Server responded with error: {}", msg),
-        ServerFnError::Args(msg) => format!("Invalid arguments: {}", msg),
-        ServerFnError::MissingArg(msg) => format!("Missing argument: {}", msg),
-        other => other.to_string(),
-    }
-}
-
 #[component]
 fn HomePage() -> impl IntoView {
     let (show_register, set_show_register) = signal(false);
@@ -2168,8 +2239,12 @@ fn HomePage() -> impl IntoView {
                                         set_biometric_loading.set(false);
                                         refresh_dashboard();
                                     }
+                                    Err(ServerFnError::ServerError(msg)) => {
+                                        set_biometric_error.set(Some(msg));
+                                        set_biometric_loading.set(false);
+                                    }
                                     Err(e) => {
-                                        set_biometric_error.set(Some(clean_server_error(e)));
+                                        set_biometric_error.set(Some(e.to_string()));
                                         set_biometric_loading.set(false);
                                     }
                                 }
@@ -2189,8 +2264,12 @@ fn HomePage() -> impl IntoView {
                         set_biometric_loading.set(false);
                     }
                 }
+                Err(ServerFnError::ServerError(msg)) => {
+                    set_biometric_error.set(Some(msg));
+                    set_biometric_loading.set(false);
+                }
                 Err(e) => {
-                    set_biometric_error.set(Some(clean_server_error(e)));
+                    set_biometric_error.set(Some(e.to_string()));
                     set_biometric_loading.set(false);
                 }
             }
@@ -2227,8 +2306,12 @@ fn HomePage() -> impl IntoView {
                                             set_biometric_loading.set(false);
                                             refresh_dashboard();
                                         }
+                                        Err(ServerFnError::ServerError(msg)) => {
+                                            check_error(msg);
+                                            set_biometric_loading.set(false);
+                                        }
                                         Err(e) => {
-                                            check_error(clean_server_error(e));
+                                            check_error(e.to_string());
                                             set_biometric_loading.set(false);
                                         }
                                     }
@@ -2255,8 +2338,12 @@ fn HomePage() -> impl IntoView {
                                             set_biometric_loading.set(false);
                                             refresh_dashboard();
                                         }
+                                        Err(ServerFnError::ServerError(msg)) => {
+                                            check_error(msg);
+                                            set_biometric_loading.set(false);
+                                        }
                                         Err(e) => {
-                                            check_error(clean_server_error(e));
+                                            check_error(e.to_string());
                                             set_biometric_loading.set(false);
                                         }
                                     }
@@ -2277,8 +2364,12 @@ fn HomePage() -> impl IntoView {
                         set_biometric_loading.set(false);
                     }
                 }
+                Err(ServerFnError::ServerError(msg)) => {
+                    check_error(msg);
+                    set_biometric_loading.set(false);
+                }
                 Err(e) => {
-                    check_error(clean_server_error(e));
+                    check_error(e.to_string());
                     set_biometric_loading.set(false);
                 }
             }
@@ -2328,11 +2419,15 @@ fn HomePage() -> impl IntoView {
     // Password Authentication Handlers
     // ----------------------------------------------------------------------------
 
-    // Fetch local testing feature flag value
+    // Fetch feature flag values
+    let (magic_link_enabled, set_magic_link_enabled) = signal(true);
     Effect::new(move |_| {
         leptos::task::spawn_local(async move {
             if let Ok(enabled) = check_local_testing_enabled().await {
                 set_show_local_links.set(enabled);
+            }
+            if let Ok(enabled) = check_magic_link_enabled().await {
+                set_magic_link_enabled.set(enabled);
             }
         });
     });
@@ -2366,8 +2461,12 @@ fn HomePage() -> impl IntoView {
                         set_password_auth_loading.set(false);
                         refresh_dashboard();
                     }
+                    Err(ServerFnError::ServerError(msg)) => {
+                        set_password_auth_error.set(Some(msg));
+                        set_password_auth_loading.set(false);
+                    }
                     Err(e) => {
-                        set_password_auth_error.set(Some(clean_server_error(e)));
+                        set_password_auth_error.set(Some(e.to_string()));
                         set_password_auth_loading.set(false);
                     }
                 }
@@ -2378,8 +2477,12 @@ fn HomePage() -> impl IntoView {
                         set_password_auth_loading.set(false);
                         refresh_dashboard();
                     }
+                    Err(ServerFnError::ServerError(msg)) => {
+                        set_password_auth_error.set(Some(msg));
+                        set_password_auth_loading.set(false);
+                    }
                     Err(e) => {
-                        set_password_auth_error.set(Some(clean_server_error(e)));
+                        set_password_auth_error.set(Some(e.to_string()));
                         set_password_auth_loading.set(false);
                     }
                 }
@@ -2465,7 +2568,13 @@ fn HomePage() -> impl IntoView {
                                 {move || if show_register.get() { "Create Account" } else { "Welcome Back" }}
                             </h2>
                             <p class="text-sm text-slate-400">
-                                {move || if show_register.get() { "Choose your preferred secure registration method" } else { "Log in using password, magic link, or biometric passkeys" }}
+                                {move || if show_register.get() {
+                                    "Choose your preferred secure registration method"
+                                } else if magic_link_enabled.get() {
+                                    "Log in using password, magic link, or biometric passkeys"
+                                } else {
+                                    "Log in using password or biometric passkeys"
+                                }}
                             </p>
                         </div>
 
@@ -2488,23 +2597,25 @@ fn HomePage() -> impl IntoView {
                                 </svg>
                                 "Password"
                             </button>
-                            <button
-                                type="button"
-                                on:click=move |_| switch_tab("magic".to_string())
-                                class=move || {
-                                    let base = "flex-1 py-2 text-xs font-semibold rounded-lg transition-all duration-150 flex items-center justify-center gap-1.5 ";
-                                    if active_tab.get() == "magic" {
-                                        format!("{base} bg-[#1f2937] text-white shadow-md border border-[#334155]")
-                                    } else {
-                                        format!("{base} text-slate-400 hover:text-white hover:bg-white/5")
+                            <Show when=move || magic_link_enabled.get()>
+                                <button
+                                    type="button"
+                                    on:click=move |_| switch_tab("magic".to_string())
+                                    class=move || {
+                                        let base = "flex-1 py-2 text-xs font-semibold rounded-lg transition-all duration-150 flex items-center justify-center gap-1.5 ";
+                                        if active_tab.get() == "magic" {
+                                            format!("{base} bg-[#1f2937] text-white shadow-md border border-[#334155]")
+                                        } else {
+                                            format!("{base} text-slate-400 hover:text-white hover:bg-white/5")
+                                        }
                                     }
-                                }
-                            >
-                                <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                                    <path stroke-linecap="round" stroke-linejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
-                                </svg>
-                                "Magic Link"
-                            </button>
+                                >
+                                    <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                        <path stroke-linecap="round" stroke-linejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+                                    </svg>
+                                    "Magic Link"
+                                </button>
+                            </Show>
                             <button
                                 type="button"
                                 on:click=move |_| switch_tab("passkey".to_string())
@@ -2751,7 +2862,11 @@ fn HomePage() -> impl IntoView {
                                         <div>
                                             <p class="text-xs font-bold text-amber-200">"Alternative Login Required"</p>
                                             <p class="text-xs text-amber-400 mt-0.5 leading-relaxed">
-                                                "This account is registered but has no passkeys on this device yet. Please log in using your Password or a Magic Link first, then register this device in Settings."
+                                                {move || if magic_link_enabled.get() {
+                                                    "This account is registered but has no passkeys on this device yet. Please log in using your Password or a Magic Link first, then register this device in Settings."
+                                                } else {
+                                                    "This account is registered but has no passkeys on this device yet. Please log in using your Password first, then register this device in Settings."
+                                                }}
                                             </p>
                                         </div>
                                     </div>
@@ -2769,19 +2884,21 @@ fn HomePage() -> impl IntoView {
                                             </svg>
                                             "Log In with Password"
                                         </button>
-                                        <button
-                                            type="button"
-                                            on:click=move |_| {
-                                                switch_tab("magic".to_string());
-                                            }
-                                            class="w-full py-2.5 bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold rounded-lg transition-all duration-150 flex items-center justify-center gap-1.5 shadow-md shadow-amber-950/30"
-                                        >
-                                            <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" />
-                                                <polyline points="22,6 12,13 2,6" />
-                                            </svg>
-                                            "Log In with Magic Link"
-                                        </button>
+                                        <Show when=move || magic_link_enabled.get()>
+                                            <button
+                                                type="button"
+                                                on:click=move |_| {
+                                                    switch_tab("magic".to_string());
+                                                }
+                                                class="w-full py-2.5 bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold rounded-lg transition-all duration-150 flex items-center justify-center gap-1.5 shadow-md shadow-amber-950/30"
+                                            >
+                                                <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                    <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" />
+                                                    <polyline points="22,6 12,13 2,6" />
+                                                </svg>
+                                                "Log In with Magic Link"
+                                            </button>
+                                        </Show>
                                     </div>
                                 </div>
                             </Show>

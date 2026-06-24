@@ -30,6 +30,7 @@ flushline = { path = "../flushline", features = ["db"] }
 matrix = { path = "../matrix", features = ["db"] }
 sponsor_allocator = { path = "../sponsor_allocator", features = ["db"] }
 potbonus = { path = "../potbonus", features = ["db"] }
+dotenvy = "0.15.7"
 
 [dev-dependencies]
 serde_json = "1.0"
