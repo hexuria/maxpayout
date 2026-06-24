@@ -2505,10 +2505,10 @@ fn HomePage() -> impl IntoView {
                                 }
                             >
                                 <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                    <path d="M2 12a10 10 0 1 0 18.8-4.3" />
-                                    <path d="M7 12a5 5 0 1 0 8.3-3.7" />
-                                    <path d="M12 12a2 2 0 1 0 3.8-1" />
-                                    <path d="M12 12v6" />
+                                    <circle cx="7.5" cy="15.5" r="5.5" />
+                                    <path d="m21 2-9.6 9.6" />
+                                    <path d="m15.5 7.5 3 3" />
+                                    <path d="m19 4 3 3" />
                                 </svg>
                                 "Passkeys"
                             </button>
@@ -2646,6 +2646,15 @@ fn HomePage() -> impl IntoView {
                                         class="w-full px-4 py-3 bg-[#0f172a] border border-[#1f2937] focus:border-[#00d4aa] rounded-xl text-white outline-none transition-all duration-150 text-sm focus:ring-1 focus:ring-[#00d4aa]"
                                     />
                                     <p class="text-[10px] text-slate-500">"Leave empty if you have logged in on this device before."</p>
+
+                                    <div class="p-3 bg-slate-950/40 border border-[#1f2937]/60 rounded-xl text-left space-y-1.5 mt-2 animate-fadeIn">
+                                        <p class="text-[10px] font-bold text-slate-300 flex items-center gap-1.5">
+                                            <span>"💡"</span> "Logging in on a new computer?"
+                                        </p>
+                                        <p class="text-[10px] text-slate-400 leading-relaxed">
+                                            "Type your registered email and click Log In. Your browser will display a secure QR code you can scan with your phone's camera to authenticate instantly."
+                                        </p>
+                                    </div>
                                 </div>
 
                                 <button
@@ -2669,10 +2678,10 @@ fn HomePage() -> impl IntoView {
                                     </Show>
                                     <Show when=move || os_brand.get() != "Apple" && os_brand.get() != "Windows">
                                         <svg class="w-4 h-4 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                            <path d="M2 12a10 10 0 1 0 18.8-4.3" />
-                                            <path d="M7 12a5 5 0 1 0 8.3-3.7" />
-                                            <path d="M12 12a2 2 0 1 0 3.8-1" />
-                                            <path d="M12 12v6" />
+                                            <circle cx="7.5" cy="15.5" r="5.5" />
+                                            <path d="m21 2-9.6 9.6" />
+                                            <path d="m15.5 7.5 3 3" />
+                                            <path d="m19 4 3 3" />
                                         </svg>
                                     </Show>
                                     {biometric_btn_text}
@@ -2721,30 +2730,46 @@ fn HomePage() -> impl IntoView {
 
                             // Biometric Fallback Suggestion Block
                             <Show when=move || passkey_fallback_suggested.get() && active_tab.get() == "passkey">
-                                <div class="p-4 bg-amber-950/40 border border-amber-800 rounded-xl text-left space-y-3 animate-fadeIn">
+                                <div class="p-4 bg-amber-950/40 border border-amber-800 rounded-xl text-left space-y-3.5 animate-fadeIn">
                                     <div class="flex gap-2.5 items-start">
                                         <svg class="w-5 h-5 text-amber-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
                                             <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
                                         </svg>
                                         <div>
-                                            <p class="text-xs font-bold text-amber-200">"No Passkeys Enrolled"</p>
+                                            <p class="text-xs font-bold text-amber-200">"Alternative Login Required"</p>
                                             <p class="text-xs text-amber-400 mt-0.5 leading-relaxed">
-                                                "This account is registered but has no passkeys on this device yet. Log in via Magic Link first, then register your device in Settings."
+                                                "This account is registered but has no passkeys on this device yet. Please log in using your Password or a Magic Link first, then register this device in Settings."
                                             </p>
                                         </div>
                                     </div>
-                                    <button
-                                        type="button"
-                                        on:click=move |_| {
-                                            switch_tab("magic".to_string());
-                                        }
-                                        class="w-full py-2 bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold rounded-lg transition-all duration-150 flex items-center justify-center gap-1 shadow-md shadow-amber-950/30"
-                                    >
-                                        "Switch to Magic Link Login"
-                                        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                                            <path stroke-linecap="round" stroke-linejoin="round" d="M14 5l7 7m0 0l-7 7m7-7H3" />
-                                        </svg>
-                                    </button>
+                                    <div class="flex flex-col gap-2">
+                                        <button
+                                            type="button"
+                                            on:click=move |_| {
+                                                switch_tab("password".to_string());
+                                            }
+                                            class="w-full py-2.5 bg-[#1f2937] hover:bg-slate-700 text-white text-xs font-semibold rounded-lg transition-all duration-150 flex items-center justify-center gap-1.5 border border-[#334155] shadow-md shadow-black/25"
+                                        >
+                                            <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+                                                <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                                            </svg>
+                                            "Log In with Password"
+                                        </button>
+                                        <button
+                                            type="button"
+                                            on:click=move |_| {
+                                                switch_tab("magic".to_string());
+                                            }
+                                            class="w-full py-2.5 bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold rounded-lg transition-all duration-150 flex items-center justify-center gap-1.5 shadow-md shadow-amber-950/30"
+                                        >
+                                            <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" />
+                                                <polyline points="22,6 12,13 2,6" />
+                                            </svg>
+                                            "Log In with Magic Link"
+                                        </button>
+                                    </div>
                                 </div>
                             </Show>
                         </div>
@@ -2909,10 +2934,10 @@ fn HomePage() -> impl IntoView {
                                         class="w-full py-1.5 bg-emerald-900/30 hover:bg-emerald-900/50 border border-emerald-700/50 hover:border-emerald-600 text-emerald-200 font-semibold text-[10px] rounded-lg transition-all duration-150 flex items-center justify-center gap-1"
                                     >
                                         <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                            <path d="M2 12a10 10 0 1 0 18.8-4.3" />
-                                            <path d="M7 12a5 5 0 1 0 8.3-3.7" />
-                                            <path d="M12 12a2 2 0 1 0 3.8-1" />
-                                            <path d="M12 12v6" />
+                                            <circle cx="7.5" cy="15.5" r="5.5" />
+                                            <path d="m21 2-9.6 9.6" />
+                                            <path d="m15.5 7.5 3 3" />
+                                            <path d="m19 4 3 3" />
                                         </svg>
                                         "Register Additional Device"
                                     </button>
