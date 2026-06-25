@@ -25,7 +25,7 @@ spin-sdk = { version = "6.0.0", optional = true }
 wasip3 = { version = "0.6.0", features = ["http-compat"], optional = true }
 wasm-bindgen = { version = "=0.2.125", optional = true }
 wasm-bindgen-futures = { version = "0.4.45", optional = true }
-web-sys = { version = "0.3", features = ["Storage", "Window", "Location", "Navigator"], optional = true }
+web-sys = { version = "0.3", features = ["Storage", "Window", "Location", "Navigator", "Clipboard"], optional = true }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 rand = { version = "0.8" }

@@ -4,10 +4,11 @@ use leptos_wasi::prelude::Handler;
 use wasip3::http::types::{ErrorCode, Request, Response};
 
 use crate::app::{
-    App, AwardPoints, GetActiveSessions, GetUserDashboardStatus, LoginPasskeyFinish,
-    LoginPasskeyStart, LoginViaMagicLink, LoginWithPassword, Logout, RegisterPasskeyFinish,
-    RegisterPasskeyFinishSignup, RegisterPasskeyStart, RegisterWithPassword, RequestMagicLink,
-    RevokeOtherSessions, RevokeSession, SetReferralCookieSsr, shell,
+    App, AwardPoints, CheckLocalTestingEnabled, CheckMagicLinkEnabled, GetActiveSessions,
+    GetUserDashboardStatus, LoginPasskeyFinish, LoginPasskeyStart, LoginViaMagicLink,
+    LoginWithPassword, Logout, RegisterPasskeyFinish, RegisterPasskeyFinishSignup,
+    RegisterPasskeyStart, RegisterWithPassword, RequestMagicLink, RevokeOtherSessions,
+    RevokeSession, SetReferralCookieSsr, shell, GetMatrixForAccount, CreateDownlineAccount,
 };
 
 struct LeptosServer;
@@ -47,6 +48,10 @@ impl wasip3::exports::http::handler::Guest for LeptosServer {
             .with_server_fn::<LoginPasskeyStart>()
             .with_server_fn::<LoginPasskeyFinish>()
             .with_server_fn::<RegisterPasskeyFinishSignup>()
+            .with_server_fn::<CheckLocalTestingEnabled>()
+            .with_server_fn::<CheckMagicLinkEnabled>()
+            .with_server_fn::<GetMatrixForAccount>()
+            .with_server_fn::<CreateDownlineAccount>()
             .generate_routes(App)
             .handle_with_context(move || shell(leptos_options.clone()), || {})
             .await

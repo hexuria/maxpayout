@@ -5,6 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock};
 use uuid::Uuid;
+use crate::app::{GraduationEvent, PotBonusConfig};
 
 // ----------------------------------------------------------------------------
 // Database Models
@@ -55,9 +56,48 @@ pub struct SessionRecord {
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub last_active_at: DateTime<Utc>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub device_name: Option<String>,
+    #[serde(default = "default_true")]
+    pub is_whitelisted: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+fn default_true() -> bool {
+    true
+}
+
+pub fn derive_device_name(user_agent: Option<&str>) -> String {
+    let ua = user_agent.unwrap_or("");
+    if ua.contains("iPhone") {
+        "iPhone".to_string()
+    } else if ua.contains("iPad") {
+        "iPad".to_string()
+    } else if ua.contains("Android") {
+        "Android Device".to_string()
+    } else if ua.contains("Macintosh") {
+        "MacBook Pro".to_string()
+    } else if ua.contains("Windows") {
+        "Windows Desktop".to_string()
+    } else if ua.contains("Linux") {
+        "Linux Workstation".to_string()
+    } else {
+        "Unknown Device".to_string()
+    }
+}
+
+impl RfnState {
+    pub fn toggle_whitelist(&mut self, session_id: Uuid) {
+        for s in self.sessions.values_mut() {
+            if s.id == session_id {
+                s.is_whitelisted = !s.is_whitelisted;
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct FlushlineAccount {
     pub id: Uuid,
     pub owner: String,
@@ -65,6 +105,8 @@ pub struct FlushlineAccount {
     pub current_pts: i32,
     pub cycle_count: i32,
     pub graduated: bool,
+    #[serde(default)]
+    pub last_cycle_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -112,6 +154,10 @@ pub struct RfnState {
     pub sponsor_pool: Vec<Uuid>,
     pub coordination_states: HashMap<Uuid, CoordinationState>,
     pub inbox_log: HashSet<Uuid>,
+    #[serde(default)]
+    pub pot_bonus_config: PotBonusConfig,
+    #[serde(default)]
+    pub graduation_events: Vec<GraduationEvent>,
 }
 
 // ----------------------------------------------------------------------------
@@ -189,10 +235,30 @@ impl SagaCoordinator {
             .get_mut(&account_id)
             .ok_or_else(|| format!("Flushline account {} not found", account_id))?;
 
+        let old_cycles = account.current_pts / 15;
         account.current_pts += points as i32;
+        let new_cycles = account.current_pts / 15;
+
+        if new_cycles > old_cycles {
+            account.cycle_count += new_cycles - old_cycles;
+            account.last_cycle_at = Some(Utc::now());
+
+            // Add graduation events for each completed cycle
+            for c in (old_cycles + 1)..=new_cycles {
+                let event = GraduationEvent {
+                    id: Uuid::now_v7(),
+                    account_id,
+                    username: account.owner.clone(),
+                    tier: "Ace".to_string(),
+                    cycle_count: c,
+                    timestamp: Utc::now(),
+                };
+                state.graduation_events.push(event);
+            }
+        }
+
         if account.current_pts >= 15 && !account.graduated {
             account.graduated = true;
-            account.cycle_count += 1;
 
             // Trigger Coordination: Flushline Graduated
             let coord = state
@@ -347,6 +413,7 @@ impl SagaCoordinator {
                     current_pts: 0,
                     cycle_count: 0,
                     graduated: false,
+                    last_cycle_at: None,
                 },
             );
 
@@ -421,5 +488,42 @@ impl SagaCoordinator {
         }
         save_state(state);
         Ok(fallback_id)
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Multi-Cycle Progression & Queue Resolution Helper Functions
+// ----------------------------------------------------------------------------
+
+pub fn resolve_tier_progress(current_pts: i32) -> (String, i32, i32) {
+    if current_pts < 1 {
+        ("Ten".to_string(), current_pts, 1)
+    } else if current_pts < 3 {
+        ("Jack".to_string(), current_pts - 1, 2)
+    } else if current_pts < 6 {
+        ("Queen".to_string(), current_pts - 3, 3)
+    } else if current_pts < 10 {
+        ("King".to_string(), current_pts - 6, 4)
+    } else if current_pts < 15 {
+        ("Ace".to_string(), current_pts - 10, 5)
+    } else {
+        ("Ace".to_string(), 5, 5) // Graduated
+    }
+}
+
+pub fn get_queue_stats(state: &RfnState, account_id: Uuid, tier_name: &str) -> (i32, i32) {
+    let mut tier_accounts: Vec<&FlushlineAccount> = state
+        .flushline_accounts
+        .values()
+        .filter(|acc| !acc.graduated && resolve_tier_progress(acc.current_pts).0 == tier_name)
+        .collect();
+
+    // Sort by ID (time-sortable or stable sorting)
+    tier_accounts.sort_by_key(|acc| acc.id);
+
+    let position = tier_accounts.iter().position(|acc| acc.id == account_id);
+    match position {
+        Some(idx) => (idx as i32, tier_accounts.len() as i32),
+        None => (-1, 0),
     }
 }
