@@ -1,3 +1,5 @@
+use crate::app::{GraduationEvent, OAuthIdentity, PotBonusConfig};
+use crate::oauth::OAuthStateRecord;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -5,7 +7,6 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock};
 use uuid::Uuid;
-use crate::app::{GraduationEvent, PotBonusConfig};
 
 // ----------------------------------------------------------------------------
 // Database Models
@@ -20,6 +21,10 @@ pub struct User {
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub password_hash: Option<String>,
+    #[serde(default)]
+    pub linked_providers: Vec<String>,
+    #[serde(default)]
+    pub oauth_identities: Vec<OAuthIdentity>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -146,6 +151,8 @@ pub struct RfnState {
     pub challenges: HashMap<Uuid, ChallengeRecord>,
     pub magic_links: HashMap<String, MagicLinkRecord>,
     pub sessions: HashMap<String, SessionRecord>,
+    #[serde(default)]
+    pub oauth_states: HashMap<String, OAuthStateRecord>,
     pub flushline_accounts: HashMap<Uuid, FlushlineAccount>,
     pub matrices: HashMap<Uuid, Matrix>,
     pub matrix_slots: Vec<MatrixSlot>,
@@ -174,32 +181,54 @@ fn get_storage_path() -> String {
 pub fn get_state() -> Arc<RwLock<RfnState>> {
     STATE_STORE
         .get_or_init(|| {
-            let path_str = get_storage_path();
-            let path = Path::new(&path_str);
+            let mut state_loaded = false;
+            let mut initial_state = RfnState::default();
 
-            let initial_state = if path.exists() {
-                if let Ok(content) = fs::read_to_string(path) {
-                    serde_json::from_str::<RfnState>(&content).unwrap_or_default()
-                } else {
-                    RfnState::default()
+            #[cfg(feature = "ssr")]
+            {
+                // Try loading from Spin Key-Value store
+                let load_result = futures::executor::block_on(async {
+                    if let Ok(store) = spin_sdk::key_value::Store::open_default().await {
+                        store.get_json::<RfnState>("rfn_state").await.ok().flatten()
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(state) = load_result {
+                    initial_state = state;
+                    state_loaded = true;
                 }
-            } else {
-                // Seed default sponsor and pool for first-time runs
-                let mut state = RfnState::default();
-                let default_sponsor_id =
-                    Uuid::parse_str("01900000-0000-0000-0000-000000000001").unwrap();
-                state.sponsor_stats.insert(
-                    default_sponsor_id,
-                    SponsorStats {
-                        account_id: default_sponsor_id,
-                        tier: "King".to_string(),
-                        cycle_count: 5,
-                        sponsored_count: 0,
-                    },
-                );
-                state.sponsor_pool.push(default_sponsor_id);
-                state
-            };
+            }
+
+            if !state_loaded {
+                let path_str = get_storage_path();
+                let path = Path::new(&path_str);
+
+                initial_state = if path.exists() {
+                    if let Ok(content) = fs::read_to_string(path) {
+                        serde_json::from_str::<RfnState>(&content).unwrap_or_default()
+                    } else {
+                        RfnState::default()
+                    }
+                } else {
+                    // Seed default sponsor and pool for first-time runs
+                    let mut state = RfnState::default();
+                    let default_sponsor_id =
+                        Uuid::parse_str("01900000-0000-0000-0000-000000000001").unwrap();
+                    state.sponsor_stats.insert(
+                        default_sponsor_id,
+                        SponsorStats {
+                            account_id: default_sponsor_id,
+                            tier: "King".to_string(),
+                            cycle_count: 5,
+                            sponsored_count: 0,
+                        },
+                    );
+                    state.sponsor_pool.push(default_sponsor_id);
+                    state
+                };
+            }
 
             Arc::new(RwLock::new(initial_state))
         })
@@ -207,13 +236,28 @@ pub fn get_state() -> Arc<RwLock<RfnState>> {
 }
 
 pub fn save_state(state: &RfnState) {
+    #[cfg(feature = "ssr")]
+    {
+        // Try saving to Spin KV store first
+        let saved = futures::executor::block_on(async {
+            if let Ok(store) = spin_sdk::key_value::Store::open_default().await {
+                store.set_json("rfn_state", state).await.is_ok()
+            } else {
+                false
+            }
+        });
+
+        if saved {
+            return;
+        }
+    }
+
+    // Fallback to filesystem
     let path_str = get_storage_path();
     let path = Path::new(&path_str);
 
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            let _ = fs::create_dir_all(parent);
-        }
+    if let Some(parent) = path.parent().filter(|p| !p.exists()) {
+        let _ = fs::create_dir_all(parent);
     }
 
     if let Ok(content) = serde_json::to_string_pretty(state) {
@@ -398,10 +442,7 @@ impl SagaCoordinator {
 
             // Create new free account ID
             let new_account_id = Uuid::new_v4();
-            let free_username = format!(
-                "FreeAccount_{}",
-                new_account_id.to_string()[..8].to_string()
-            );
+            let free_username = format!("FreeAccount_{}", &new_account_id.to_string()[..8]);
 
             // 1. Initialize in Flushline accounts
             state.flushline_accounts.insert(

@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use leptos::prelude::*;
 use leptos_meta::*;
 use leptos_router::components::{Route, Router, Routes};
@@ -5,10 +6,8 @@ use leptos_router::hooks::use_query_map;
 use leptos_router::path;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
 
-#[cfg(feature = "ssr")]
-use chrono::Utc as ChronoUtc;
+use crate::oauth::OAuthStartResponse;
 
 #[cfg(feature = "hydrate")]
 use wasm_bindgen::prelude::*;
@@ -215,6 +214,13 @@ extern "C" {
 // Shared Context Data Structs
 // ----------------------------------------------------------------------------
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct OAuthIdentity {
+    pub provider: String,         // "Google", "Apple", "Microsoft", "Facebook"
+    pub provider_user_id: String, // The unique, stable "sub" or ID returned by the provider
+    pub linked_at: DateTime<Utc>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct UserInfo {
     pub id: Uuid,
@@ -223,6 +229,21 @@ pub struct UserInfo {
     pub role: String,
     #[serde(default)]
     pub has_passkey: bool,
+    #[serde(default)]
+    pub linked_providers: Vec<String>,
+    #[serde(default)]
+    pub oauth_identities: Vec<OAuthIdentity>,
+}
+
+#[cfg_attr(all(feature = "hydrate", not(feature = "ssr")), allow(dead_code))]
+fn linked_provider_labels(identities: &[OAuthIdentity]) -> Vec<String> {
+    let mut providers = Vec::new();
+    for identity in identities {
+        if !providers.contains(&identity.provider) {
+            providers.push(identity.provider.clone());
+        }
+    }
+    providers
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -317,7 +338,7 @@ pub struct GraduationEvent {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct PotBonusConfig {
     pub total_pot_pool: f64,
-    pub selective_rule: String, // "SoloWinner" or "Top5"
+    pub selective_rule: String,    // "SoloWinner" or "Top5"
     pub selective_min_shares: i32, // e.g. 2 cycles (30 pts)
 }
 
@@ -352,7 +373,7 @@ pub struct DashboardStatus {
     pub referrals: Vec<ReferralInfo>,
     pub user_device_is_whitelisted: bool,
     pub accounts: Vec<AccountProgressInfo>,
-    
+
     // Pot Bonus Mechanics & Diagnostical Fields
     pub pot_bonus_config: PotBonusConfig,
     pub tier_queues: Vec<TierQueueInfo>,
@@ -526,6 +547,8 @@ pub async fn request_magic_link(
                             role: "user".to_string(),
                             created_at: Utc::now(),
                             password_hash: None,
+                            linked_providers: Vec::new(),
+                            oauth_identities: Vec::new(),
                         },
                     );
                     id
@@ -787,10 +810,12 @@ pub async fn login_via_magic_link(token: String) -> Result<UserInfo, ServerFnErr
 
         Ok(UserInfo {
             id: user.id,
-            email: user.email,
-            username: user.username,
-            role: user.role,
+            email: user.email.clone(),
+            username: user.username.clone(),
+            role: user.role.clone(),
             has_passkey,
+            linked_providers: linked_provider_labels(&user.oauth_identities),
+            oauth_identities: user.oauth_identities.clone(),
         })
     }
     #[cfg(not(feature = "ssr"))]
@@ -896,6 +921,8 @@ pub async fn register_with_password(
             role: "user".to_string(),
             created_at: Utc::now(),
             password_hash: Some(password_hash),
+            linked_providers: Vec::new(),
+            oauth_identities: Vec::new(),
         };
         state.users.insert(user_id, user.clone());
 
@@ -1004,10 +1031,12 @@ pub async fn register_with_password(
 
         Ok(UserInfo {
             id: user.id,
-            email: user.email,
-            username: user.username,
-            role: user.role,
+            email: user.email.clone(),
+            username: user.username.clone(),
+            role: user.role.clone(),
             has_passkey,
+            linked_providers: linked_provider_labels(&user.oauth_identities),
+            oauth_identities: user.oauth_identities.clone(),
         })
     }
     #[cfg(not(feature = "ssr"))]
@@ -1123,10 +1152,12 @@ pub async fn login_with_password(
 
         Ok(UserInfo {
             id: user.id,
-            email: user.email,
-            username: user.username,
-            role: user.role,
+            email: user.email.clone(),
+            username: user.username.clone(),
+            role: user.role.clone(),
             has_passkey,
+            linked_providers: linked_provider_labels(&user.oauth_identities),
+            oauth_identities: user.oauth_identities.clone(),
         })
     }
     #[cfg(not(feature = "ssr"))]
@@ -1218,6 +1249,83 @@ pub async fn logout() -> Result<(), ServerFnError<String>> {
     }
     #[cfg(not(feature = "ssr"))]
     {
+        Err(ServerFnError::ServerError(
+            "SSR feature not enabled".to_string(),
+        ))
+    }
+}
+
+#[server(prefix = "/api")]
+pub async fn update_user_profile(
+    username: String,
+    email: String,
+) -> Result<(), ServerFnError<String>> {
+    #[cfg(feature = "ssr")]
+    {
+        use crate::rfn_store::{get_state, save_state};
+
+        ssr_helpers::check_rate_limit()?;
+        let state_store = get_state();
+        let mut state = state_store.write().unwrap();
+
+        // 1. Authenticate user
+        let user_id = {
+            let user = ssr_helpers::authenticate_request(&state)?;
+            user.id
+        };
+
+        // 2. Validate input
+        let username = username.trim().to_string();
+        let email = email.trim().to_lowercase();
+
+        if username.is_empty() {
+            return Err(ServerFnError::ServerError(
+                "Username cannot be empty".to_string(),
+            ));
+        }
+        if email.is_empty() {
+            return Err(ServerFnError::ServerError(
+                "Email cannot be empty".to_string(),
+            ));
+        }
+
+        // Check if email or username is already taken by another user
+        for u in state.users.values() {
+            if u.id != user_id {
+                if u.email == email {
+                    return Err(ServerFnError::ServerError(
+                        "Email is already taken".to_string(),
+                    ));
+                }
+                if u.username == username {
+                    return Err(ServerFnError::ServerError(
+                        "Username is already taken".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // 3. Update User Record
+        if let Some(user) = state.users.get_mut(&user_id) {
+            user.username = username.clone();
+            user.email = email.clone();
+        } else {
+            return Err(ServerFnError::ServerError("User not found".to_string()));
+        }
+
+        // Also update any FlushlineAccount owner name associated with this user
+        if let Some(flushline_acc) = state.flushline_accounts.get_mut(&user_id) {
+            flushline_acc.owner = username.clone();
+        }
+
+        // 4. Save state
+        save_state(&state);
+
+        Ok(())
+    }
+    #[cfg(not(feature = "ssr"))]
+    {
+        let _ = (username, email);
         Err(ServerFnError::ServerError(
             "SSR feature not enabled".to_string(),
         ))
@@ -1371,14 +1479,20 @@ pub async fn get_user_dashboard_status() -> Result<DashboardStatus, ServerFnErro
         for (&acc_id, &u_id) in &state.pot_bonus_registrations {
             if u_id == user.id {
                 if let Some(fa) = state.flushline_accounts.get(&acc_id) {
-                    let (tier_name, tier_pts, tier_threshold) = crate::rfn_store::resolve_tier_progress(fa.current_pts);
-                    let (q_pos, q_tot) = crate::rfn_store::get_queue_stats(&state, fa.id, &tier_name);
+                    let (tier_name, tier_pts, tier_threshold) =
+                        crate::rfn_store::resolve_tier_progress(fa.current_pts);
+                    let (q_pos, q_tot) =
+                        crate::rfn_store::get_queue_stats(&state, fa.id, &tier_name);
 
-                    let has_matrix_cycle = state.matrices.values()
+                    let has_matrix_cycle = state
+                        .matrices
+                        .values()
                         .any(|m| m.owner_id == fa.id && m.status == "Cycled");
                     let is_pot_qualified = fa.graduated && has_matrix_cycle;
 
-                    let m_cycles = state.matrices.values()
+                    let m_cycles = state
+                        .matrices
+                        .values()
                         .filter(|m| m.owner_id == fa.id && m.status == "Cycled")
                         .count() as i32;
 
@@ -1409,14 +1523,19 @@ pub async fn get_user_dashboard_status() -> Result<DashboardStatus, ServerFnErro
 
         if !primary_account_exists {
             if let Some(fa) = state.flushline_accounts.get(&user.id) {
-                let (tier_name, tier_pts, tier_threshold) = crate::rfn_store::resolve_tier_progress(fa.current_pts);
+                let (tier_name, tier_pts, tier_threshold) =
+                    crate::rfn_store::resolve_tier_progress(fa.current_pts);
                 let (q_pos, q_tot) = crate::rfn_store::get_queue_stats(&state, fa.id, &tier_name);
 
-                let has_matrix_cycle = state.matrices.values()
+                let has_matrix_cycle = state
+                    .matrices
+                    .values()
                     .any(|m| m.owner_id == fa.id && m.status == "Cycled");
                 let is_pot_qualified = fa.graduated && has_matrix_cycle;
 
-                let m_cycles = state.matrices.values()
+                let m_cycles = state
+                    .matrices
+                    .values()
                     .filter(|m| m.owner_id == fa.id && m.status == "Cycled")
                     .count() as i32;
 
@@ -1443,7 +1562,9 @@ pub async fn get_user_dashboard_status() -> Result<DashboardStatus, ServerFnErro
 
         for acc in &accounts_info {
             total_flushline_cycles += acc.cycle_count as f64;
-            total_matrix_cycles += state.matrices.values()
+            total_matrix_cycles += state
+                .matrices
+                .values()
                 .filter(|m| m.owner_id == acc.id && m.status == "Cycled")
                 .count() as f64;
         }
@@ -1459,15 +1580,18 @@ pub async fn get_user_dashboard_status() -> Result<DashboardStatus, ServerFnErro
             let mut tier_accounts: Vec<&crate::rfn_store::FlushlineAccount> = state
                 .flushline_accounts
                 .values()
-                .filter(|acc| !acc.graduated && crate::rfn_store::resolve_tier_progress(acc.current_pts).0 == *tier_name)
+                .filter(|acc| {
+                    !acc.graduated
+                        && crate::rfn_store::resolve_tier_progress(acc.current_pts).0 == *tier_name
+                })
                 .collect();
-            
+
             // Sort by ID (same stable sort as get_queue_stats)
             tier_accounts.sort_by_key(|acc| acc.id);
-            
+
             let count = tier_accounts.len() as i32;
             let top_card_owner = tier_accounts.first().map(|acc| acc.owner.clone());
-            
+
             let top_50: Vec<AccountQueueInfo> = tier_accounts
                 .iter()
                 .take(50)
@@ -1478,7 +1602,7 @@ pub async fn get_user_dashboard_status() -> Result<DashboardStatus, ServerFnErro
                     last_cycle_at: acc.last_cycle_at,
                 })
                 .collect();
-                
+
             tier_queues.push(TierQueueInfo {
                 tier_name: tier_name.to_string(),
                 top_card_owner,
@@ -1506,7 +1630,9 @@ pub async fn get_user_dashboard_status() -> Result<DashboardStatus, ServerFnErro
         let user_total_shares: i32 = state
             .flushline_accounts
             .values()
-            .filter(|acc| acc.graduated && state.pot_bonus_registrations.get(&acc.id) == Some(&user.id))
+            .filter(|acc| {
+                acc.graduated && state.pot_bonus_registrations.get(&acc.id) == Some(&user.id)
+            })
             .map(|acc| acc.cycle_count)
             .sum();
 
@@ -1520,7 +1646,9 @@ pub async fn get_user_dashboard_status() -> Result<DashboardStatus, ServerFnErro
         let mut qualified_selective_accounts: Vec<&crate::rfn_store::FlushlineAccount> = state
             .flushline_accounts
             .values()
-            .filter(|acc| acc.graduated && acc.cycle_count >= state.pot_bonus_config.selective_min_shares)
+            .filter(|acc| {
+                acc.graduated && acc.cycle_count >= state.pot_bonus_config.selective_min_shares
+            })
             .collect();
 
         // Sort: cycle_count DESC, then last_cycle_at ASC (earliest tie breaker)
@@ -1560,10 +1688,12 @@ pub async fn get_user_dashboard_status() -> Result<DashboardStatus, ServerFnErro
         Ok(DashboardStatus {
             user: Some(UserInfo {
                 id: user.id,
-                email: user.email,
-                username: user.username,
-                role: user.role,
+                email: user.email.clone(),
+                username: user.username.clone(),
+                role: user.role.clone(),
                 has_passkey,
+                linked_providers: linked_provider_labels(&user.oauth_identities),
+                oauth_identities: user.oauth_identities.clone(),
             }),
             flushline,
             matrix,
@@ -1618,7 +1748,8 @@ pub async fn get_matrix_for_account(
 
         // Sort chronologically using slot insertion order
         user_matrices.sort_by_key(|m| {
-            state.matrix_slots
+            state
+                .matrix_slots
                 .iter()
                 .position(|s| s.matrix_id == m.id)
                 .unwrap_or(usize::MAX)
@@ -1632,20 +1763,21 @@ pub async fn get_matrix_for_account(
             } else {
                 format!("#{}", cycle_num)
             };
-            cycle_options.push(CycleOption {
-                cycle_num,
-                label,
-            });
+            cycle_options.push(CycleOption { cycle_num, label });
         }
 
         let target_matrix = if let Some(num) = cycle_number {
             if num > 0 && (num as usize) <= user_matrices.len() {
                 &user_matrices[(num - 1) as usize]
             } else {
-                user_matrices.last().ok_or_else(|| "No matrices found for this account".to_string())?
+                user_matrices
+                    .last()
+                    .ok_or_else(|| "No matrices found for this account".to_string())?
             }
         } else {
-            user_matrices.last().ok_or_else(|| "No matrices found for this account".to_string())?
+            user_matrices
+                .last()
+                .ok_or_else(|| "No matrices found for this account".to_string())?
         };
 
         let mut slot_infos = Vec::new();
@@ -1719,7 +1851,9 @@ pub async fn create_downline_account(
         let new_id = uuid::Uuid::now_v7();
         let username_trimmed = username.trim().to_string();
         if username_trimmed.is_empty() {
-            return Err(ServerFnError::ServerError("Username cannot be empty".to_string()));
+            return Err(ServerFnError::ServerError(
+                "Username cannot be empty".to_string(),
+            ));
         }
 
         // Register in flushline
@@ -1762,7 +1896,6 @@ pub async fn create_downline_account(
         Err(ServerFnError::ServerError("SSR not enabled".to_string()))
     }
 }
-
 
 #[server(prefix = "/api")]
 pub async fn get_active_sessions() -> Result<Vec<SessionInfo>, ServerFnError<String>> {
@@ -1972,7 +2105,10 @@ pub async fn simulate_downline_signup() -> Result<(), ServerFnError<String>> {
 }
 
 #[server(prefix = "/api")]
-pub async fn award_points(account_id: Uuid, points: u32) -> Result<AwardResponse, ServerFnError<String>> {
+pub async fn award_points(
+    account_id: Uuid,
+    points: u32,
+) -> Result<AwardResponse, ServerFnError<String>> {
     #[cfg(feature = "ssr")]
     {
         use crate::rfn_store::{SagaCoordinator, get_state};
@@ -2166,6 +2302,7 @@ pub enum PasskeyStartResponse {
 #[server(prefix = "/api")]
 pub async fn login_passkey_start(
     email: String,
+    is_signup: bool,
 ) -> Result<PasskeyStartResponse, ServerFnError<String>> {
     #[cfg(feature = "ssr")]
     {
@@ -2181,15 +2318,57 @@ pub async fn login_passkey_start(
         let challenge_bytes: [u8; 32] = rand::random();
         let challenge_b64 = URL_SAFE_NO_PAD.encode(challenge_bytes);
 
-        if email.is_empty() {
-            // Discoverable credentials challenge
-            let challenge_response = RequestChallengeResponse {
-                public_key: PublicKeyCredentialRequestOptions {
+        if is_signup {
+            if email.is_empty() {
+                return Err(ServerFnError::ServerError(
+                    "Email address is required for registration.".to_string(),
+                ));
+            }
+
+            let state = state_store.read().unwrap();
+            let email_exists = state.users.values().any(|u| u.email == email);
+            if email_exists {
+                return Err(ServerFnError::ServerError(
+                    "This email is already registered. Please log in instead.".to_string(),
+                ));
+            }
+            drop(state);
+
+            // Trigger registration challenge
+            let new_user_id = Uuid::new_v4();
+            let user_id_b64 = URL_SAFE_NO_PAD.encode(new_user_id.as_bytes());
+            let display_username = email.split('@').next().unwrap_or("user").to_string();
+
+            let challenge_response = CreationChallengeResponse {
+                public_key: PublicKeyCredentialCreationOptions {
                     challenge: challenge_b64,
+                    rp: Rp {
+                        name: "MaxPayout".to_string(),
+                        id: "localhost".to_string(),
+                    },
+                    user: WebauthnUser {
+                        id: user_id_b64,
+                        name: display_username.clone(),
+                        displayName: display_username.clone(),
+                    },
+                    pubKeyCredParams: vec![
+                        PubKeyCredParam {
+                            alg: -7,
+                            cred_type: "public-key".to_string(),
+                        }, // ES256
+                        PubKeyCredParam {
+                            alg: -257,
+                            cred_type: "public-key".to_string(),
+                        }, // RS256
+                    ],
                     timeout: 60000,
-                    rpId: "localhost".to_string(),
-                    allowCredentials: vec![],
-                    userVerification: "preferred".to_string(),
+                    excludeCredentials: vec![],
+                    authenticatorSelection: AuthenticatorSelection {
+                        authenticatorAttachment: None,
+                        requireResidentKey: true,
+                        userVerification: "preferred".to_string(),
+                    },
+                    attestation: "none".to_string(),
                 },
             };
 
@@ -2201,64 +2380,37 @@ pub async fn login_passkey_start(
                 challenge_id,
                 ChallengeRecord {
                     challenge_id,
-                    user_id: None,
+                    user_id: Some(new_user_id),
                     challenge_json,
                     expires_at: Utc::now() + Duration::minutes(10),
-                    email: None,
+                    email: Some(email.clone()),
                 },
             );
 
             save_state(&state);
 
             let challenge_str = serde_json::to_string(&challenge_response).unwrap();
-            return Ok(PasskeyStartResponse::Login {
+
+            Ok(PasskeyStartResponse::Register {
                 challenge_id,
                 challenge_json: challenge_str,
-            });
-        }
-
-        let state = state_store.read().unwrap();
-        let user_opt = state.users.values().find(|u| u.email == email).cloned();
-
-        match user_opt {
-            Some(user) => {
-                // Find registered credentials
-                let user_passkeys: Vec<crate::rfn_store::PasskeyRecord> = state
-                    .passkeys
-                    .iter()
-                    .filter(|pk| pk.user_id == user.id)
-                    .cloned()
-                    .collect();
-
-                if user_passkeys.is_empty() {
-                    return Err(ServerFnError::ServerError("This account exists but has no passkeys registered. Please log in using a Magic Link first, then enroll your device under Settings.".to_string()));
-                }
-
-                let allow_credentials = user_passkeys
-                    .iter()
-                    .map(|pk| {
-                        let cred_id_b64 = URL_SAFE_NO_PAD.encode(&pk.credential_id);
-                        CredentialDescriptor {
-                            cred_type: "public-key".to_string(),
-                            id: cred_id_b64,
-                            transports: None,
-                        }
-                    })
-                    .collect();
-
+                email,
+            })
+        } else {
+            // is_signup == false (Login flow)
+            if email.is_empty() {
+                // Discoverable credentials challenge (empty email allowed only for login/assertion)
                 let challenge_response = RequestChallengeResponse {
                     public_key: PublicKeyCredentialRequestOptions {
                         challenge: challenge_b64,
                         timeout: 60000,
                         rpId: "localhost".to_string(),
-                        allowCredentials: allow_credentials,
+                        allowCredentials: vec![],
                         userVerification: "preferred".to_string(),
                     },
                 };
 
-                drop(state);
                 let mut state = state_store.write().unwrap();
-
                 let challenge_id = Uuid::new_v4();
                 let challenge_json = serde_json::to_value(&challenge_response).unwrap();
 
@@ -2266,93 +2418,128 @@ pub async fn login_passkey_start(
                     challenge_id,
                     ChallengeRecord {
                         challenge_id,
-                        user_id: Some(user.id),
+                        user_id: None,
                         challenge_json,
                         expires_at: Utc::now() + Duration::minutes(10),
-                        email: Some(user.email.clone()),
+                        email: None,
                     },
                 );
 
                 save_state(&state);
 
                 let challenge_str = serde_json::to_string(&challenge_response).unwrap();
-
                 Ok(PasskeyStartResponse::Login {
                     challenge_id,
                     challenge_json: challenge_str,
                 })
-            }
-            None => {
-                // User does not exist - trigger a passwordless registration challenge!
-                let new_user_id = Uuid::new_v4();
-                let user_id_b64 = URL_SAFE_NO_PAD.encode(new_user_id.as_bytes());
-                let display_username = email.split('@').next().unwrap_or("user").to_string();
+            } else {
+                let state = state_store.read().unwrap();
+                let user_opt = state.users.values().find(|u| u.email == email).cloned();
 
-                let challenge_response = CreationChallengeResponse {
-                    public_key: PublicKeyCredentialCreationOptions {
-                        challenge: challenge_b64,
-                        rp: Rp {
-                            name: "MaxPayout".to_string(),
-                            id: "localhost".to_string(),
-                        },
-                        user: WebauthnUser {
-                            id: user_id_b64,
-                            name: display_username.clone(),
-                            displayName: display_username.clone(),
-                        },
-                        pubKeyCredParams: vec![
-                            PubKeyCredParam {
-                                alg: -7,
-                                cred_type: "public-key".to_string(),
-                            }, // ES256
-                            PubKeyCredParam {
-                                alg: -257,
-                                cred_type: "public-key".to_string(),
-                            }, // RS256
-                        ],
-                        timeout: 60000,
-                        excludeCredentials: vec![],
-                        authenticatorSelection: AuthenticatorSelection {
-                            authenticatorAttachment: None,
-                            requireResidentKey: true,
-                            userVerification: "preferred".to_string(),
-                        },
-                        attestation: "none".to_string(),
-                    },
-                };
+                match user_opt {
+                    Some(user) => {
+                        // Find registered credentials
+                        let user_passkeys: Vec<crate::rfn_store::PasskeyRecord> = state
+                            .passkeys
+                            .iter()
+                            .filter(|pk| pk.user_id == user.id)
+                            .cloned()
+                            .collect();
 
-                drop(state);
-                let mut state = state_store.write().unwrap();
+                        if user_passkeys.is_empty() {
+                            return Err(ServerFnError::ServerError("This account exists but has no passkeys registered. Please log in using a Magic Link first, then enroll your device under Settings.".to_string()));
+                        }
 
-                let challenge_id = Uuid::new_v4();
-                let challenge_json = serde_json::to_value(&challenge_response).unwrap();
+                        let allow_credentials = user_passkeys
+                            .iter()
+                            .map(|pk| {
+                                let cred_id_b64 = URL_SAFE_NO_PAD.encode(&pk.credential_id);
+                                CredentialDescriptor {
+                                    cred_type: "public-key".to_string(),
+                                    id: cred_id_b64,
+                                    transports: None,
+                                }
+                            })
+                            .collect();
 
-                state.challenges.insert(
-                    challenge_id,
-                    ChallengeRecord {
-                        challenge_id,
-                        user_id: Some(new_user_id),
-                        challenge_json,
-                        expires_at: Utc::now() + Duration::minutes(10),
-                        email: Some(email.clone()),
-                    },
-                );
+                        let challenge_response = RequestChallengeResponse {
+                            public_key: PublicKeyCredentialRequestOptions {
+                                challenge: challenge_b64,
+                                timeout: 60000,
+                                rpId: "localhost".to_string(),
+                                allowCredentials: allow_credentials,
+                                userVerification: "preferred".to_string(),
+                            },
+                        };
 
-                save_state(&state);
+                        drop(state);
+                        let mut state = state_store.write().unwrap();
 
-                let challenge_str = serde_json::to_string(&challenge_response).unwrap();
+                        let challenge_id = Uuid::new_v4();
+                        let challenge_json = serde_json::to_value(&challenge_response).unwrap();
 
-                Ok(PasskeyStartResponse::Register {
-                    challenge_id,
-                    challenge_json: challenge_str,
-                    email,
-                })
+                        state.challenges.insert(
+                            challenge_id,
+                            ChallengeRecord {
+                                challenge_id,
+                                user_id: Some(user.id),
+                                challenge_json,
+                                expires_at: Utc::now() + Duration::minutes(10),
+                                email: Some(user.email.clone()),
+                            },
+                        );
+
+                        save_state(&state);
+
+                        let challenge_str = serde_json::to_string(&challenge_response).unwrap();
+
+                        Ok(PasskeyStartResponse::Login {
+                            challenge_id,
+                            challenge_json: challenge_str,
+                        })
+                    }
+                    None => Err(ServerFnError::ServerError(
+                        "No registered account found with this email.".to_string(),
+                    )),
+                }
             }
         }
     }
     #[cfg(not(feature = "ssr"))]
     {
-        let _ = email;
+        let _ = (email, is_signup);
+        Err(ServerFnError::ServerError("SSR not enabled".to_string()))
+    }
+}
+
+#[server(prefix = "/api")]
+pub async fn unlink_oauth_provider(provider: String) -> Result<Vec<String>, ServerFnError<String>> {
+    #[cfg(feature = "ssr")]
+    {
+        use crate::rfn_store::{get_state, save_state};
+
+        let provider =
+            crate::oauth::OAuthProvider::parse(&provider).map_err(ServerFnError::ServerError)?;
+        let state_store = get_state();
+        let mut state = state_store.write().unwrap();
+        let db_user = ssr_helpers::authenticate_request(&state)?;
+
+        let user = state
+            .users
+            .get_mut(&db_user.id)
+            .ok_or_else(|| ServerFnError::ServerError("User not found".to_string()))?;
+
+        user.linked_providers.retain(|p| p != provider.label());
+        user.oauth_identities
+            .retain(|oid| oid.provider != provider.label());
+
+        let updated = linked_provider_labels(&user.oauth_identities);
+        save_state(&state);
+        Ok(updated)
+    }
+    #[cfg(not(feature = "ssr"))]
+    {
+        let _ = provider;
         Err(ServerFnError::ServerError("SSR not enabled".to_string()))
     }
 }
@@ -2466,10 +2653,12 @@ pub async fn login_passkey_finish(
 
         Ok(UserInfo {
             id: user.id,
-            email: user.email,
-            username: user.username,
-            role: user.role,
+            email: user.email.clone(),
+            username: user.username.clone(),
+            role: user.role.clone(),
             has_passkey,
+            linked_providers: linked_provider_labels(&user.oauth_identities),
+            oauth_identities: user.oauth_identities.clone(),
         })
     }
     #[cfg(not(feature = "ssr"))]
@@ -2528,6 +2717,8 @@ pub async fn register_passkey_finish_signup(
             role: "user".to_string(),
             created_at: Utc::now(),
             password_hash: None,
+            linked_providers: Vec::new(),
+            oauth_identities: Vec::new(),
         };
         state.users.insert(user_id, user.clone());
 
@@ -2642,15 +2833,393 @@ pub async fn register_passkey_finish_signup(
 
         Ok(UserInfo {
             id: user.id,
-            email: user.email,
-            username: user.username,
-            role: user.role,
+            email: user.email.clone(),
+            username: user.username.clone(),
+            role: user.role.clone(),
             has_passkey,
+            linked_providers: linked_provider_labels(&user.oauth_identities),
+            oauth_identities: user.oauth_identities.clone(),
         })
     }
     #[cfg(not(feature = "ssr"))]
     {
         let _ = (challenge_id, credential_json);
+        Err(ServerFnError::ServerError(
+            "SSR feature not enabled".to_string(),
+        ))
+    }
+}
+
+// ----------------------------------------------------------------------------
+// OAuth 2.0 backend implementation
+// ----------------------------------------------------------------------------
+
+#[server(prefix = "/api", endpoint = "auth/login")]
+pub async fn start_oauth_redirect(
+    provider: String,
+) -> Result<OAuthStartResponse, ServerFnError<String>> {
+    #[cfg(feature = "ssr")]
+    {
+        use crate::oauth::{
+            OAuthProvider, OAuthProviderConfig, OAuthStateRecord, build_authorization_url,
+        };
+        use crate::rfn_store::{get_state, save_state};
+        use leptos_wasi::response::ResponseOptions;
+
+        let provider = OAuthProvider::parse(&provider).map_err(ServerFnError::ServerError)?;
+        let config = OAuthProviderConfig::from_env(provider).map_err(ServerFnError::ServerError)?;
+        let redirect_base = std::env::var("OAUTH_REDIRECT_BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:3000".to_string());
+        let redirect_uri = config.redirect_uri(&redirect_base);
+
+        let state_store = get_state();
+        let mut db_state = state_store.write().unwrap();
+        let linking_user_id = ssr_helpers::authenticate_request(&db_state)
+            .ok()
+            .map(|user| user.id);
+        db_state
+            .oauth_states
+            .retain(|_, record| !record.is_expired());
+
+        let state_record = OAuthStateRecord::new(provider, redirect_uri, linking_user_id);
+        let auth_url = build_authorization_url(&config, &state_record);
+        let state_token = state_record.state.clone();
+        db_state
+            .oauth_states
+            .insert(state_token.clone(), state_record);
+        save_state(&db_state);
+
+        if let Some(res_opts) = use_context::<ResponseOptions>() {
+            let cookie_str = format!(
+                "oauth_state={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600",
+                state_token
+            );
+            res_opts.insert_header(
+                http::header::SET_COOKIE,
+                http::HeaderValue::from_str(&cookie_str).unwrap(),
+            );
+        }
+
+        Ok(OAuthStartResponse { auth_url })
+    }
+    #[cfg(not(feature = "ssr"))]
+    {
+        let _ = provider;
+        Err(ServerFnError::ServerError(
+            "SSR feature not enabled".to_string(),
+        ))
+    }
+}
+
+#[server(prefix = "/api", endpoint = "auth/callback")]
+pub async fn oauth_callback(
+    provider: String,
+    code: String,
+    state: String,
+) -> Result<(), ServerFnError<String>> {
+    #[cfg(feature = "ssr")]
+    {
+        use crate::oauth::{
+            OAuthProvider, OAuthProviderConfig, VerifiedOAuthProfile, build_code_exchange_body,
+            consume_oauth_state, facebook_profile_from_response, generate_apple_client_secret,
+            get_json, post_form_json, verify_oidc_id_token,
+        };
+        use crate::rfn_store::{
+            FlushlineAccount, Matrix, MatrixSlot, SessionRecord, User, get_state, save_state,
+        };
+        use chrono::Utc;
+        use leptos_wasi::response::ResponseOptions;
+        use rand::Rng;
+        use rand::distributions::Alphanumeric;
+
+        let provider = OAuthProvider::parse(&provider).map_err(ServerFnError::ServerError)?;
+        let config = OAuthProviderConfig::from_env(provider).map_err(ServerFnError::ServerError)?;
+
+        // The cookie is an advisory browser guard; the persisted state record below
+        // remains the replay-prevention source of truth.
+        let parts = use_context::<http::request::Parts>();
+        let mut state_cookie = None;
+        if let Some(ref p) = parts {
+            if let Some(cookie_header) = p
+                .headers
+                .get(http::header::COOKIE)
+                .and_then(|h| h.to_str().ok())
+            {
+                for cookie_part in cookie_header.split(';') {
+                    let trimmed = cookie_part.trim();
+                    if let Some(val) = trimmed.strip_prefix("oauth_state=") {
+                        state_cookie = Some(val.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+
+        if matches!(state_cookie.as_deref(), Some(cookie) if cookie != state.as_str()) {
+            return Err(ServerFnError::ServerError(
+                "CSRF state validation failed (cookie mismatch)".to_string(),
+            ));
+        }
+
+        let state_record = {
+            let state_store = get_state();
+            let mut db_state = state_store.write().unwrap();
+            let record = consume_oauth_state(&mut db_state.oauth_states, provider, &state)
+                .map_err(ServerFnError::ServerError)?;
+            save_state(&db_state);
+            record
+        };
+
+        let client_secret =
+            if provider == OAuthProvider::Apple && config.token_url.contains("appleid.apple.com") {
+                Some(generate_apple_client_secret(&config)?)
+            } else {
+                config.client_secret.clone()
+            };
+        let body = build_code_exchange_body(
+            &config,
+            &code,
+            &state_record.redirect_uri,
+            &state_record.code_verifier,
+            client_secret.as_deref(),
+        );
+        let token_response = post_form_json(&config.token_url, body)
+            .await
+            .map_err(|e| ServerFnError::ServerError(format!("Code exchange failed: {e}")))?;
+
+        let profile: VerifiedOAuthProfile = if provider == OAuthProvider::Facebook {
+            let access_token = token_response
+                .get("access_token")
+                .and_then(|t| t.as_str())
+                .ok_or_else(|| {
+                    ServerFnError::ServerError("Facebook response missing access_token".to_string())
+                })?;
+            let profile_url = config.profile_url.as_ref().ok_or_else(|| {
+                ServerFnError::ServerError("Facebook profile URL not configured".to_string())
+            })?;
+            let profile_json = get_json(profile_url, Some(access_token))
+                .await
+                .map_err(ServerFnError::ServerError)?;
+            facebook_profile_from_response(&profile_json).map_err(ServerFnError::ServerError)?
+        } else {
+            let id_token = token_response
+                .get("id_token")
+                .and_then(|token| token.as_str())
+                .ok_or_else(|| {
+                    ServerFnError::ServerError("Token response missing id_token".to_string())
+                })?;
+            let jwks_url = config
+                .jwks_url
+                .as_ref()
+                .ok_or_else(|| ServerFnError::ServerError("JWKS URL not configured".to_string()))?;
+            let jwks = get_json(jwks_url, None)
+                .await
+                .map_err(ServerFnError::ServerError)?;
+            verify_oidc_id_token(&config, &state_record, id_token, &jwks)
+                .map_err(ServerFnError::ServerError)?
+        };
+
+        let state_store = get_state();
+        let mut db_state = state_store.write().unwrap();
+
+        let final_user_id = if let Some(logged_in_uid) = state_record.linking_user_id {
+            let is_already_linked = db_state.users.values().any(|u| {
+                u.id != logged_in_uid
+                    && u.oauth_identities.iter().any(|oid| {
+                        oid.provider == profile.provider.label()
+                            && oid.provider_user_id == profile.provider_user_id
+                    })
+            });
+
+            if is_already_linked {
+                return Err(ServerFnError::ServerError(
+                    "This social account is already linked to another profile.".to_string(),
+                ));
+            }
+
+            let user = db_state
+                .users
+                .get_mut(&logged_in_uid)
+                .ok_or_else(|| ServerFnError::ServerError("User session invalid".to_string()))?;
+
+            if user.oauth_identities.iter().any(|oid| {
+                oid.provider == profile.provider.label()
+                    && oid.provider_user_id != profile.provider_user_id
+            }) {
+                return Err(ServerFnError::ServerError(format!(
+                    "{} is already linked to a different account.",
+                    profile.provider.label()
+                )));
+            }
+
+            if !user.oauth_identities.iter().any(|oid| {
+                oid.provider == profile.provider.label()
+                    && oid.provider_user_id == profile.provider_user_id
+            }) {
+                user.oauth_identities.push(OAuthIdentity {
+                    provider: profile.provider.label().to_string(),
+                    provider_user_id: profile.provider_user_id.clone(),
+                    linked_at: Utc::now(),
+                });
+            }
+            user.linked_providers = linked_provider_labels(&user.oauth_identities);
+
+            logged_in_uid
+        } else {
+            let existing_by_provider = db_state
+                .users
+                .iter()
+                .find(|(_, u)| {
+                    u.oauth_identities.iter().any(|oid| {
+                        oid.provider == profile.provider.label()
+                            && oid.provider_user_id == profile.provider_user_id
+                    })
+                })
+                .map(|(id, _)| *id);
+
+            if let Some(uid) = existing_by_provider {
+                uid
+            } else if db_state.users.values().any(|u| u.email == profile.email) {
+                return Err(ServerFnError::ServerError(
+                    "An account already exists with this email. Log in first, then link this social account from Settings.".to_string(),
+                ));
+            } else {
+                let new_uid = Uuid::new_v4();
+                let display_username = profile
+                    .display_name
+                    .clone()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        profile
+                            .email
+                            .split('@')
+                            .next()
+                            .unwrap_or("user")
+                            .to_string()
+                    });
+                let mut new_user = User {
+                    id: new_uid,
+                    email: profile.email.clone(),
+                    username: display_username.clone(),
+                    role: "user".to_string(),
+                    created_at: Utc::now(),
+                    password_hash: None,
+                    linked_providers: Vec::new(),
+                    oauth_identities: vec![OAuthIdentity {
+                        provider: profile.provider.label().to_string(),
+                        provider_user_id: profile.provider_user_id.clone(),
+                        linked_at: Utc::now(),
+                    }],
+                };
+                new_user.linked_providers = linked_provider_labels(&new_user.oauth_identities);
+                db_state.users.insert(new_uid, new_user);
+
+                db_state.flushline_accounts.insert(
+                    new_uid,
+                    FlushlineAccount {
+                        id: new_uid,
+                        owner: display_username.clone(),
+                        tier: "Ten".to_string(),
+                        current_pts: 0,
+                        cycle_count: 0,
+                        graduated: false,
+                        last_cycle_at: None,
+                    },
+                );
+                db_state.pot_bonus_registrations.insert(new_uid, new_uid);
+
+                let matrix_id = Uuid::new_v4();
+                db_state.matrices.insert(
+                    matrix_id,
+                    Matrix {
+                        id: matrix_id,
+                        owner_id: new_uid,
+                        status: "Filling".to_string(),
+                    },
+                );
+                db_state.matrix_slots.push(MatrixSlot {
+                    matrix_id,
+                    slot_number: 1,
+                    account_id: new_uid,
+                });
+
+                let mut sponsor_id = parts.as_ref().and_then(ssr_helpers::resolve_sponsor_id);
+                if sponsor_id.is_none() && !db_state.sponsor_pool.is_empty() {
+                    sponsor_id = Some(db_state.sponsor_pool[0]);
+                }
+                if let Some(sp_id) = sponsor_id {
+                    let _ = crate::rfn_store::SagaCoordinator::place_in_matrix(
+                        &mut db_state,
+                        new_uid,
+                        sp_id,
+                        &display_username,
+                    );
+                }
+
+                new_uid
+            }
+        };
+
+        let session_token: String = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(64)
+            .map(char::from)
+            .collect();
+
+        let session_id = Uuid::new_v4();
+        let expires_at = Utc::now() + chrono::Duration::days(7);
+
+        let user_agent = parts
+            .as_ref()
+            .and_then(|p| p.headers.get(http::header::USER_AGENT))
+            .and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+        let ip_address = parts
+            .as_ref()
+            .and_then(|p| p.headers.get("x-forwarded-for"))
+            .and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+
+        db_state.sessions.insert(
+            session_token.clone(),
+            SessionRecord {
+                id: session_id,
+                user_id: final_user_id,
+                session_token: session_token.clone(),
+                user_agent: user_agent.clone(),
+                ip_address: ip_address.clone(),
+                expires_at,
+                created_at: Utc::now(),
+                last_active_at: Utc::now(),
+                device_id: Some(uuid::Uuid::now_v7().to_string()[..8].to_string()),
+                device_name: Some(crate::rfn_store::derive_device_name(user_agent.as_deref())),
+                is_whitelisted: true,
+            },
+        );
+
+        save_state(&db_state);
+
+        if let Some(res_opts) = use_context::<ResponseOptions>() {
+            let cookie_str = format!(
+                "session_token={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800",
+                session_token
+            );
+            res_opts.insert_header(
+                http::header::SET_COOKIE,
+                http::HeaderValue::from_str(&cookie_str).unwrap(),
+            );
+            res_opts.insert_header(
+                http::header::SET_COOKIE,
+                http::HeaderValue::from_str(
+                    "oauth_state=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+                )
+                .unwrap(),
+            );
+        }
+
+        Ok(())
+    }
+    #[cfg(not(feature = "ssr"))]
+    {
+        let _ = (provider, code, state);
         Err(ServerFnError::ServerError(
             "SSR feature not enabled".to_string(),
         ))
@@ -2710,6 +3279,13 @@ async fn sleep_delay(duration: std::time::Duration) {
     }
 }
 
+#[cfg(feature = "hydrate")]
+fn redirect_browser_to_url(url: &str) {
+    if let Some(window) = web_sys::window() {
+        let _ = window.location().set_href(url);
+    }
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
@@ -2732,6 +3308,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("security") view=HomePage />
                     <Route path=path!("linked") view=HomePage />
                     <Route path=path!("settings") view=HomePage />
+                    <Route path=path!("api/auth/callback/:provider") view=AuthCallback />
                     <Route path=path!("/*any") view=NotFound />
                 </Routes>
             </main>
@@ -2820,7 +3397,9 @@ fn HomePage() -> impl IntoView {
 
                 // Initialize or validate selected_account_id
                 let cur_selected = selected_account_id.get();
-                let exists = cur_selected.map(|sid| data.accounts.iter().any(|acc| acc.id == sid)).unwrap_or(false);
+                let exists = cur_selected
+                    .map(|sid| data.accounts.iter().any(|acc| acc.id == sid))
+                    .unwrap_or(false);
                 if !exists {
                     if let Some(first_acc) = data.accounts.first() {
                         set_selected_account_id.set(Some(first_acc.id));
@@ -2842,9 +3421,9 @@ fn HomePage() -> impl IntoView {
 
     #[cfg(feature = "hydrate")]
     {
-        use wasm_bindgen::prelude::*;
         use chrono::Datelike;
         use chrono::Timelike;
+        use wasm_bindgen::prelude::*;
 
         // Effect for Live Countdown
         Effect::new(move |_| {
@@ -2854,8 +3433,9 @@ fn HomePage() -> impl IntoView {
                     let now = chrono::Local::now();
                     let weekday_num = now.weekday().num_days_from_monday() as i64; // Mon=0, Sun=6
                     let seconds_today = now.time().num_seconds_from_midnight() as i64;
-                    let seconds_until_sunday = ((6 - weekday_num) * 86400) + (86400 - seconds_today) - 1;
-                    
+                    let seconds_until_sunday =
+                        ((6 - weekday_num) * 86400) + (86400 - seconds_today) - 1;
+
                     if seconds_until_sunday > 0 {
                         let hours = seconds_until_sunday / 3600;
                         let mins = (seconds_until_sunday % 3600) / 60;
@@ -2865,16 +3445,18 @@ fn HomePage() -> impl IntoView {
                         set_time_left.set("00:00:00".to_string());
                     }
                 }) as Box<dyn FnMut()>);
-                
+
                 let window = web_sys::window().unwrap();
-                let id = window.set_interval_with_callback_and_timeout_and_arguments_0(
-                    f.as_ref().unchecked_ref(),
-                    1000,
-                ).unwrap();
+                let id = window
+                    .set_interval_with_callback_and_timeout_and_arguments_0(
+                        f.as_ref().unchecked_ref(),
+                        1000,
+                    )
+                    .unwrap();
                 f.forget();
                 id
             };
-            
+
             on_cleanup(move || {
                 if let Some(window) = web_sys::window() {
                     let _ = window.clear_interval_with_handle(handle);
@@ -2888,16 +3470,18 @@ fn HomePage() -> impl IntoView {
                 let f = Closure::wrap(Box::new(move || {
                     refresh_dashboard();
                 }) as Box<dyn FnMut()>);
-                
+
                 let window = web_sys::window().unwrap();
-                let id = window.set_interval_with_callback_and_timeout_and_arguments_0(
-                    f.as_ref().unchecked_ref(),
-                    3000,
-                ).unwrap();
+                let id = window
+                    .set_interval_with_callback_and_timeout_and_arguments_0(
+                        f.as_ref().unchecked_ref(),
+                        3000,
+                    )
+                    .unwrap();
                 f.forget();
                 id
             };
-            
+
             on_cleanup(move || {
                 if let Some(window) = web_sys::window() {
                     let _ = window.clear_interval_with_handle(handle);
@@ -2924,8 +3508,9 @@ fn HomePage() -> impl IntoView {
     let filtered_accounts = move || {
         let accounts = dashboard_data.get().accounts;
         let query = combobox_query.get().trim().to_lowercase();
-        
-        let is_selected_acc_label = selected_account_id.get()
+
+        let is_selected_acc_label = selected_account_id
+            .get()
             .and_then(|sid| accounts.iter().find(|a| a.id == sid))
             .map(|a| a.label.to_lowercase() == query)
             .unwrap_or(false);
@@ -2955,7 +3540,11 @@ fn HomePage() -> impl IntoView {
                     set_combobox_open.set(true);
                     set_combobox_highlighted.set(0);
                 } else {
-                    let next = if current_highlighted >= max_idx { 0 } else { current_highlighted + 1 };
+                    let next = if current_highlighted >= max_idx {
+                        0
+                    } else {
+                        current_highlighted + 1
+                    };
                     set_combobox_highlighted.set(next);
                 }
             }
@@ -2965,7 +3554,11 @@ fn HomePage() -> impl IntoView {
                     set_combobox_open.set(true);
                     set_combobox_highlighted.set(max_idx);
                 } else {
-                    let prev = if current_highlighted == 0 { max_idx } else { current_highlighted - 1 };
+                    let prev = if current_highlighted == 0 {
+                        max_idx
+                    } else {
+                        current_highlighted - 1
+                    };
                     set_combobox_highlighted.set(prev);
                 }
             }
@@ -3071,6 +3664,7 @@ fn HomePage() -> impl IntoView {
     // ----------------------------------------------------------------------------
     let (biometric_error, set_biometric_error) = signal(Option::<String>::None);
     let (biometric_loading, set_biometric_loading) = signal(false);
+    let (social_login_loading, set_social_login_loading) = signal(Option::<String>::None);
 
     let handle_register_passkey = move || {
         set_biometric_loading.set(true);
@@ -3127,6 +3721,7 @@ fn HomePage() -> impl IntoView {
 
     let handle_login_passkey = move || {
         let email = email_input.get();
+        let is_signup = show_register.get();
         set_biometric_loading.set(true);
         set_biometric_error.set(None);
         set_passkey_fallback_suggested.set(false);
@@ -3139,7 +3734,7 @@ fn HomePage() -> impl IntoView {
                 }
             };
 
-            match login_passkey_start(email).await {
+            match login_passkey_start(email, is_signup).await {
                 Ok(resp) => {
                     #[cfg(feature = "hydrate")]
                     {
@@ -3260,9 +3855,31 @@ fn HomePage() -> impl IntoView {
     let (linked_microsoft, set_linked_microsoft) = signal(false);
     let (linked_facebook, set_linked_facebook) = signal(false);
     let (linking_provider, set_linking_provider) = signal(Option::<String>::None);
+
+    Effect::new(move |_| {
+        if let Some(user) = dashboard_data.get().user {
+            set_linked_google.set(user.linked_providers.contains(&"Google".to_string()));
+            set_linked_apple.set(user.linked_providers.contains(&"Apple".to_string()));
+            set_linked_microsoft.set(user.linked_providers.contains(&"Microsoft".to_string()));
+            set_linked_facebook.set(user.linked_providers.contains(&"Facebook".to_string()));
+        }
+    });
+
     let (selected_theme, set_selected_theme) = signal("obsidian".to_string());
     let (selected_avatar, set_selected_avatar) = signal("avatar_1".to_string());
     let (profile_success_toast, set_profile_success_toast) = signal(false);
+    let (settings_username, set_settings_username) = signal(String::new());
+    let (settings_email, set_settings_email) = signal(String::new());
+    let (profile_error_message, set_profile_error_message) = signal(Option::<String>::None);
+
+    Effect::new(move |_| {
+        if active_section.get() == "settings" {
+            if let Some(user) = dashboard_data.get().user {
+                set_settings_username.set(user.username);
+                set_settings_email.set(user.email);
+            }
+        }
+    });
 
     let handle_toggle_whitelist = move |session_id: Uuid| {
         leptos::task::spawn_local(async move {
@@ -3285,7 +3902,12 @@ fn HomePage() -> impl IntoView {
     #[allow(dead_code, unused_variables)]
     let handle_award_points = move || {
         let account_id = selected_account_id.get().unwrap_or_else(|| {
-            dashboard_data.get().accounts.first().map(|a| a.id).unwrap_or_default()
+            dashboard_data
+                .get()
+                .accounts
+                .first()
+                .map(|a| a.id)
+                .unwrap_or_default()
         });
         if account_id.is_nil() {
             return;
@@ -3476,7 +4098,9 @@ fn HomePage() -> impl IntoView {
     };
 
     let get_slot_account_id = move |idx: usize| {
-        matrix_info.get().and_then(|m| m.slots.get(idx).and_then(|s| s.account_id))
+        matrix_info
+            .get()
+            .and_then(|m| m.slots.get(idx).and_then(|s| s.account_id))
     };
 
     let get_slot_parent_account_id = move |slot_number: i32| -> Option<Uuid> {
@@ -3516,7 +4140,9 @@ fn HomePage() -> impl IntoView {
                     set_create_downline_loading.set(false);
                     refresh_dashboard();
                     if let Some(curr_acc) = selected_matrix_account.get() {
-                        if let Ok(res) = get_matrix_for_account(curr_acc, selected_cycle_number.get()).await {
+                        if let Ok(res) =
+                            get_matrix_for_account(curr_acc, selected_cycle_number.get()).await
+                        {
                             set_matrix_info.set(Some(res.current_matrix));
                             set_matrix_cycle_options.set(res.cycle_options);
                         }
@@ -3565,14 +4191,16 @@ fn HomePage() -> impl IntoView {
         if !show_downline_modal.get() {
             return view! { <div class="hidden"></div> }.into_any();
         }
-        
+
         let sponsor_name = move || {
             let sp_id = modal_sponsor_id.get();
             let state_data = dashboard_data.get();
             if let Some(id) = sp_id {
                 if let Some(acc) = state_data.accounts.iter().find(|a| a.id == id) {
                     acc.label.clone()
-                } else if let Some(ref_item) = state_data.referrals.iter().find(|r| r.account_id == id) {
+                } else if let Some(ref_item) =
+                    state_data.referrals.iter().find(|r| r.account_id == id)
+                {
                     ref_item.username.clone()
                 } else {
                     if let Some(m) = matrix_info.get_untracked() {
@@ -3580,7 +4208,10 @@ fn HomePage() -> impl IntoView {
                             return slot.username.clone();
                         }
                     }
-                    format!("Account ID: {}", id.to_string().chars().take(8).collect::<String>())
+                    format!(
+                        "Account ID: {}",
+                        id.to_string().chars().take(8).collect::<String>()
+                    )
                 }
             } else {
                 "None".to_string()
@@ -3588,7 +4219,8 @@ fn HomePage() -> impl IntoView {
         };
 
         let slot_label = move || {
-            modal_slot_number.get()
+            modal_slot_number
+                .get()
                 .map(|s| format!("Slot {}", s))
                 .unwrap_or_else(|| "Empty Slot".to_string())
         };
@@ -3673,7 +4305,9 @@ fn HomePage() -> impl IntoView {
         if is_filled {
             let is_user_owned = {
                 let list = dashboard_data.get().accounts;
-                acc_id.map(|id| list.iter().any(|a| a.id == id)).unwrap_or(false)
+                acc_id
+                    .map(|id| list.iter().any(|a| a.id == id))
+                    .unwrap_or(false)
             };
 
             let on_node_click = move |_| {
@@ -3686,7 +4320,7 @@ fn HomePage() -> impl IntoView {
             };
 
             view! {
-                <div 
+                <div
                     on:click=on_node_click
                     class=move || {
                         let base = "flex flex-col items-center relative z-10 ";
@@ -3698,17 +4332,17 @@ fn HomePage() -> impl IntoView {
                     }
                 >
                     <div class=move || {
-                        let ring = if is_user { 
-                            "border-[#00d4aa] ring-4 ring-[#00d4aa]/20" 
+                        let ring = if is_user {
+                            "border-[#00d4aa] ring-4 ring-[#00d4aa]/20"
                         } else if is_user_owned {
                             "border-indigo-400 group-hover:border-[#00d4aa] transition-colors"
-                        } else { 
-                            "border-zinc-700" 
+                        } else {
+                            "border-zinc-700"
                         };
                         format!("w-16 h-16 rounded-full bg-zinc-900 border-2 {} flex flex-col items-center justify-center font-bold text-sm text-white shadow-xl relative", ring)
                     }>
                         {username.chars().take(2).collect::<String>().to_uppercase()}
-                        
+
                         <Show when=move || is_user_owned>
                             <span class="absolute -top-1.5 -right-1.5 bg-[#00d4aa] text-[#0b0f19] text-[8px] font-extrabold px-1.5 py-0.5 rounded-full uppercase tracking-wider">
                                 "You"
@@ -3721,7 +4355,7 @@ fn HomePage() -> impl IntoView {
             }.into_any()
         } else {
             view! {
-                <div 
+                <div
                     on:click=move |_| handle_open_create_modal(slot_number)
                     class="flex flex-col items-center relative z-10 cursor-pointer group"
                 >
@@ -3960,7 +4594,9 @@ fn HomePage() -> impl IntoView {
                             <Show when=move || active_tab.get() == "passkey">
                                 <div class="space-y-4">
                                     <div class="space-y-1">
-                                        <label class="text-xs font-medium text-slate-400 uppercase tracking-wider">"Email Address (Optional)"</label>
+                                        <label class="text-xs font-medium text-slate-400 uppercase tracking-wider">
+                                            {move || if show_register.get() { "Email Address" } else { "Email Address (Optional)" }}
+                                        </label>
                                         <input
                                             type="email"
                                             placeholder="name@example.com"
@@ -3968,7 +4604,9 @@ fn HomePage() -> impl IntoView {
                                             prop:value=email_input
                                             class="w-full px-4 py-3 bg-[#0f172a] border border-[#1f2937] focus:border-[#00d4aa] rounded-xl text-white outline-none transition-all duration-150 text-sm focus:ring-1 focus:ring-[#00d4aa]"
                                         />
-                                        <p class="text-[10px] text-slate-500">"Leave empty if you have logged in on this device before."</p>
+                                        <p class="text-[10px] text-slate-500">
+                                            {move || if show_register.get() { "Required to set up your account." } else { "Leave empty if you have logged in on this device before." }}
+                                        </p>
 
                                         <div class="p-3 bg-slate-950/40 border border-[#1f2937]/60 rounded-xl text-left space-y-1.5 mt-2 animate-fadeIn">
                                             <p class="text-[10px] font-bold text-slate-300 flex items-center gap-1.5">
@@ -4101,6 +4739,148 @@ fn HomePage() -> impl IntoView {
                                         </div>
                                     </div>
                                 </Show>
+
+                                // Horizontal Divider
+                                <div class="relative flex items-center py-2">
+                                    <div class="flex-grow border-t border-[#1f2937]"></div>
+                                    <span class="flex-shrink mx-4 text-slate-500 text-[10px] font-bold uppercase tracking-widest">"Or continue with"</span>
+                                    <div class="flex-grow border-t border-[#1f2937]"></div>
+                                </div>
+
+                                // Social Logins 2x2 Grid
+                                <div class="grid grid-cols-2 gap-3">
+                                    // Google Button
+                                    <button
+                                        type="button"
+                                        on:click=move |_| {
+                                            set_social_login_loading.set(Some("Google".to_string()));
+                                            leptos::task::spawn_local(async move {
+                                                sleep_delay(std::time::Duration::from_millis(1200)).await;
+                                                match start_oauth_redirect("Google".to_string()).await {
+                                                    Ok(response) => {
+                                                        let _ = &response;
+                                                        #[cfg(feature = "hydrate")]
+                                                        redirect_browser_to_url(&response.auth_url);
+                                                    }
+                                                    Err(_) => set_social_login_loading.set(None),
+                                                }
+                                            });
+                                        }
+                                        disabled=move || social_login_loading.get().is_some()
+                                        class="py-2.5 px-4 bg-[#0f172a]/60 hover:bg-[#1f2937] text-white rounded-xl border border-[#1f2937] hover:border-zinc-700 transition-all duration-150 flex items-center justify-center gap-2 text-xs font-semibold shadow-lg shadow-black/20"
+                                    >
+                                        <Show
+                                            when=move || social_login_loading.get() == Some("Google".to_string())
+                                            fallback=move || view! {
+                                                <svg class="w-3.5 h-3.5 fill-current text-slate-300" viewBox="0 0 24 24">
+                                                    <path d="M12.24 10.285V13.4h6.887c-.275 1.565-1.88 4.604-6.887 4.604-4.33 0-7.866-3.577-7.866-8s3.536-8 7.866-8c2.46 0 4.105 1.025 5.047 1.926l2.427-2.334C17.955.996 15.26 0 12.24 0 5.58 0 0 5.37 0 12s5.58 12 12.24 12c6.96 0 11.57-4.89 11.57-11.79 0-.79-.085-1.4-.19-1.925H12.24z"/>
+                                                </svg>
+                                            }
+                                        >
+                                            <div class="w-3 h-3 border-2 border-transparent border-t-white rounded-full animate-spin"></div>
+                                        </Show>
+                                        "Google"
+                                    </button>
+
+                                    // Apple Button
+                                    <button
+                                        type="button"
+                                        on:click=move |_| {
+                                            set_social_login_loading.set(Some("Apple".to_string()));
+                                            leptos::task::spawn_local(async move {
+                                                sleep_delay(std::time::Duration::from_millis(1200)).await;
+                                                match start_oauth_redirect("Apple".to_string()).await {
+                                                    Ok(response) => {
+                                                        let _ = &response;
+                                                        #[cfg(feature = "hydrate")]
+                                                        redirect_browser_to_url(&response.auth_url);
+                                                    }
+                                                    Err(_) => set_social_login_loading.set(None),
+                                                }
+                                            });
+                                        }
+                                        disabled=move || social_login_loading.get().is_some()
+                                        class="py-2.5 px-4 bg-[#0f172a]/60 hover:bg-[#1f2937] text-white rounded-xl border border-[#1f2937] hover:border-zinc-700 transition-all duration-150 flex items-center justify-center gap-2 text-xs font-semibold shadow-lg shadow-black/20"
+                                    >
+                                        <Show
+                                            when=move || social_login_loading.get() == Some("Apple".to_string())
+                                            fallback=move || view! {
+                                                <svg class="w-3.5 h-3.5 fill-current text-slate-300" viewBox="0 0 24 24">
+                                                    <path d="M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1.183-4.961 3.014-2.117 3.675-.546 9.103 1.519 12.09 1.013 1.454 2.208 3.09 3.792 3.039 1.52-.065 2.09-.987 3.935-.987 1.831 0 2.35.987 3.96.948 1.637-.026 2.676-1.48 3.676-2.948 1.156-1.688 1.636-3.325 1.662-3.415-.039-.013-3.182-1.221-3.22-4.857-.026-3.04 2.48-4.494 2.597-4.559-1.429-2.09-3.623-2.324-4.39-2.376-2-.156-3.675 1.09-4.61 1.09zM15.53 3.83c.843-1.012 1.4-2.427 1.245-3.83-1.207.052-2.662.805-3.532 1.818-.78.896-1.454 2.338-1.273 3.714 1.338.104 2.715-.688 3.559-1.701"/>
+                                                </svg>
+                                            }
+                                        >
+                                            <div class="w-3 h-3 border-2 border-transparent border-t-white rounded-full animate-spin"></div>
+                                        </Show>
+                                        "Apple"
+                                    </button>
+
+                                    // Microsoft Button
+                                    <button
+                                        type="button"
+                                        on:click=move |_| {
+                                            set_social_login_loading.set(Some("Microsoft".to_string()));
+                                            leptos::task::spawn_local(async move {
+                                                sleep_delay(std::time::Duration::from_millis(1200)).await;
+                                                match start_oauth_redirect("Microsoft".to_string()).await {
+                                                    Ok(response) => {
+                                                        let _ = &response;
+                                                        #[cfg(feature = "hydrate")]
+                                                        redirect_browser_to_url(&response.auth_url);
+                                                    }
+                                                    Err(_) => set_social_login_loading.set(None),
+                                                }
+                                            });
+                                        }
+                                        disabled=move || social_login_loading.get().is_some()
+                                        class="py-2.5 px-4 bg-[#0f172a]/60 hover:bg-[#1f2937] text-white rounded-xl border border-[#1f2937] hover:border-zinc-700 transition-all duration-150 flex items-center justify-center gap-2 text-xs font-semibold shadow-lg shadow-black/20"
+                                    >
+                                        <Show
+                                            when=move || social_login_loading.get() == Some("Microsoft".to_string())
+                                            fallback=move || view! {
+                                                <svg class="w-3.5 h-3.5 fill-current text-slate-300" viewBox="0 0 24 24">
+                                                    <path d="M0 0h11v11H0zm13 0h11v11H13zM0 13h11v11H0zm13 0h11v11H13z"/>
+                                                </svg>
+                                            }
+                                        >
+                                            <div class="w-3 h-3 border-2 border-transparent border-t-white rounded-full animate-spin"></div>
+                                        </Show>
+                                        "Microsoft"
+                                    </button>
+
+                                    // Facebook Button
+                                    <button
+                                        type="button"
+                                        on:click=move |_| {
+                                            set_social_login_loading.set(Some("Facebook".to_string()));
+                                            leptos::task::spawn_local(async move {
+                                                sleep_delay(std::time::Duration::from_millis(1200)).await;
+                                                match start_oauth_redirect("Facebook".to_string()).await {
+                                                    Ok(response) => {
+                                                        let _ = &response;
+                                                        #[cfg(feature = "hydrate")]
+                                                        redirect_browser_to_url(&response.auth_url);
+                                                    }
+                                                    Err(_) => set_social_login_loading.set(None),
+                                                }
+                                            });
+                                        }
+                                        disabled=move || social_login_loading.get().is_some()
+                                        class="py-2.5 px-4 bg-[#0f172a]/60 hover:bg-[#1f2937] text-white rounded-xl border border-[#1f2937] hover:border-zinc-700 transition-all duration-150 flex items-center justify-center gap-2 text-xs font-semibold shadow-lg shadow-black/20"
+                                    >
+                                        <Show
+                                            when=move || social_login_loading.get() == Some("Facebook".to_string())
+                                            fallback=move || view! {
+                                                <svg class="w-3.5 h-3.5 fill-current text-slate-300" viewBox="0 0 24 24">
+                                                    <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/>
+                                                </svg>
+                                            }
+                                        >
+                                            <div class="w-3 h-3 border-2 border-transparent border-t-white rounded-full animate-spin"></div>
+                                        </Show>
+                                        "Facebook"
+                                    </button>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -4495,7 +5275,7 @@ fn HomePage() -> impl IntoView {
                                                         let label = acc.label.clone();
                                                         let id = acc.id;
                                                         let tier = acc.tier.clone();
-                                                        
+
                                                         view! {
                                                             <div
                                                                 on:mousedown=move |ev| {
@@ -4627,7 +5407,7 @@ fn HomePage() -> impl IntoView {
                                         let data = dashboard_data.get();
                                         let sel_id_opt = selected_account_id.get();
                                         let account_progress = data.accounts.iter().find(|acc| Some(acc.id) == sel_id_opt).cloned();
-                                        
+
                                         if let Some(acc) = account_progress {
                                             view! {
                                                 <div class="space-y-6 animate-fadeIn min-h-0 lg:flex-1 lg:flex lg:flex-col lg:overflow-hidden">
@@ -4641,7 +5421,7 @@ fn HomePage() -> impl IntoView {
                                                                 "Active: " {acc.tier.clone()} "_FLOW"
                                                             </div>
                                                         </div>
-                                                        
+
                                                         <div class="grid grid-cols-5 gap-3">
                                                             {["Ten", "Jack", "Queen", "King", "Ace"].into_iter().map(|tier_name| {
                                                                 let acc_cloned = acc.clone();
@@ -4653,14 +5433,14 @@ fn HomePage() -> impl IntoView {
                                                                     "Ace" => 5,
                                                                     _ => 0,
                                                                 };
-                                                                
+
                                                                 let active_val = tier_order(&acc_cloned.tier);
                                                                 let card_val = tier_order(tier_name);
-                                                                
+
                                                                 let is_active = active_val == card_val && !acc_cloned.graduated;
                                                                 let is_passed = acc_cloned.graduated || (active_val > card_val);
                                                                 let is_locked = !is_active && !is_passed;
-                                                                
+
                                                                 let tier_label = match tier_name {
                                                                     "Ten" => "10",
                                                                     "Jack" => "J",
@@ -4703,7 +5483,7 @@ fn HomePage() -> impl IntoView {
                                                                     (0, t)
                                                                 };
 
-                                                                let fill_pct = ((tier_pts_val as f32) / (tier_threshold_val as f32) * 100.0).min(100.0).max(0.0);
+                                                                let fill_pct = ((tier_pts_val as f32) / (tier_threshold_val as f32) * 100.0).clamp(0.0, 100.0);
                                                                 let queue_pos = acc_cloned.queue_position;
                                                                 let has_queue_pos = queue_pos > 0;
 
@@ -4711,7 +5491,7 @@ fn HomePage() -> impl IntoView {
                                                                 let queue_info = data_val.tier_queues.iter().find(|t| t.tier_name == tier_name);
                                                                 let top_owner = queue_info.and_then(|q| q.top_card_owner.clone());
                                                                 let top_owner_str = top_owner.unwrap_or_else(|| "None".to_string());
-                                                                
+
                                                                 let top_owner_passed = top_owner_str.clone();
                                                                 let top_owner_active = top_owner_str.clone();
                                                                 let top_owner_locked = top_owner_str.clone();
@@ -4772,7 +5552,7 @@ fn HomePage() -> impl IntoView {
                                                             }).collect_view()}
                                                         </div>
                                                     </section>
-                                                    
+
                                                     // Middle Row: Pot (8 cols) & Top Entities (4 cols)
                                                     <div class="grid grid-cols-12 gap-6 min-h-0 lg:flex-1">
                                                         // Aggregate Pot & Live Logs
@@ -4827,7 +5607,7 @@ fn HomePage() -> impl IntoView {
                                                                     </div>
                                                                 </section>
                                                             </div>
-                                                            
+
                                                             // Live Network Stream Log Terminal
                                                             <section class="border border-zinc-800 bg-[#03060b] flex flex-col min-h-0 flex-1 rounded-2xl overflow-hidden shadow-xl">
                                                                 <div class="px-4 py-2 border-b border-zinc-800 flex justify-between items-center bg-[#090e1a]/80">
@@ -4865,7 +5645,7 @@ fn HomePage() -> impl IntoView {
                                                                 </div>
                                                             </section>
                                                         </div>
-                                                        
+
                                                         // Top Entities Leaderboard (Right Side - Vertical)
                                                         <div class="col-span-4 flex flex-col min-h-0 lg:h-full">
                                                             <section class="border border-zinc-800 bg-[#0b1326] flex flex-col h-full rounded-2xl overflow-hidden shadow-2xl">
@@ -4887,7 +5667,7 @@ fn HomePage() -> impl IntoView {
                                                                     {move || {
                                                                         let data = dashboard_data.get();
                                                                         let mut entries = Vec::new();
-                                                                        
+
                                                                         // Add user sub-accounts
                                                                         for acc in &data.accounts {
                                                                             let cycles = acc.cycle_count;
@@ -4898,7 +5678,7 @@ fn HomePage() -> impl IntoView {
                                                                                 format!("${:.1}k", val_eq / 1000.0),
                                                                             ));
                                                                         }
-                                                                        
+
                                                                         // Add referrals
                                                                         for r in &data.referrals {
                                                                             let cycles = match r.tier.as_str() {
@@ -4915,10 +5695,10 @@ fn HomePage() -> impl IntoView {
                                                                                 format!("${:.1}k", val_eq / 1000.0),
                                                                             ));
                                                                         }
-                                                                        
+
                                                                         // Sort by cycles descending
-                                                                        entries.sort_by(|a, b| b.1.cmp(&a.1));
-                                                                        
+                                                                        entries.sort_by_key(|x| std::cmp::Reverse(x.1));
+
                                                                         entries.into_iter().enumerate().take(6).map(|(idx, (name, cycles, val_eq_str))| {
                                                                             let rank = idx + 1;
                                                                             let rank_str = format!("{:02}", rank);
@@ -4946,7 +5726,7 @@ fn HomePage() -> impl IntoView {
                                                             </section>
                                                         </div>
                                                     </div>
-                                                    
+
                                                     // Footer Live Ticker removed
                                                 </div>
                                             }.into_any()
@@ -5512,7 +6292,7 @@ fn HomePage() -> impl IntoView {
                         </div>
                     </Show>
 
-                    // LINKED ACCOUNTS PANEL (Simulated)
+                    // LINKED ACCOUNTS PANEL
                     <Show when=move || active_section.get() == "linked">
                         <div class="space-y-8 animate-fadeIn">
                             <div class="border-b border-zinc-800 pb-5">
@@ -5535,12 +6315,29 @@ fn HomePage() -> impl IntoView {
                                     </div>
                                     <button
                                         on:click=move |_| {
-                                            set_linking_provider.set(Some("Google".to_string()));
-                                            leptos::task::spawn_local(async move {
-                                                sleep_delay(std::time::Duration::from_millis(1200)).await;
-                                                set_linked_google.update(|v| *v = !*v);
-                                                set_linking_provider.set(None);
-                                            });
+                                            let linked = linked_google.get();
+                                            if linked {
+                                                set_linking_provider.set(Some("Google".to_string()));
+                                                leptos::task::spawn_local(async move {
+                                                    sleep_delay(std::time::Duration::from_millis(1200)).await;
+                                                    let _ = unlink_oauth_provider("Google".to_string()).await;
+                                                    refresh_dashboard();
+                                                    set_linking_provider.set(None);
+                                                });
+                                            } else {
+                                                set_linking_provider.set(Some("Google".to_string()));
+                                                leptos::task::spawn_local(async move {
+                                                    sleep_delay(std::time::Duration::from_millis(1200)).await;
+                                                    match start_oauth_redirect("Google".to_string()).await {
+                                                        Ok(response) => {
+                                                            let _ = &response;
+                                                            #[cfg(feature = "hydrate")]
+                                                            redirect_browser_to_url(&response.auth_url);
+                                                        }
+                                                        Err(_) => set_linking_provider.set(None),
+                                                    }
+                                                });
+                                            }
                                         }
                                         class=move || {
                                             let linked = linked_google.get();
@@ -5569,12 +6366,29 @@ fn HomePage() -> impl IntoView {
                                     </div>
                                     <button
                                         on:click=move |_| {
-                                            set_linking_provider.set(Some("Apple".to_string()));
-                                            leptos::task::spawn_local(async move {
-                                                sleep_delay(std::time::Duration::from_millis(1200)).await;
-                                                set_linked_apple.update(|v| *v = !*v);
-                                                set_linking_provider.set(None);
-                                            });
+                                            let linked = linked_apple.get();
+                                            if linked {
+                                                set_linking_provider.set(Some("Apple".to_string()));
+                                                leptos::task::spawn_local(async move {
+                                                    sleep_delay(std::time::Duration::from_millis(1200)).await;
+                                                    let _ = unlink_oauth_provider("Apple".to_string()).await;
+                                                    refresh_dashboard();
+                                                    set_linking_provider.set(None);
+                                                });
+                                            } else {
+                                                set_linking_provider.set(Some("Apple".to_string()));
+                                                leptos::task::spawn_local(async move {
+                                                    sleep_delay(std::time::Duration::from_millis(1200)).await;
+                                                    match start_oauth_redirect("Apple".to_string()).await {
+                                                        Ok(response) => {
+                                                            let _ = &response;
+                                                            #[cfg(feature = "hydrate")]
+                                                            redirect_browser_to_url(&response.auth_url);
+                                                        }
+                                                        Err(_) => set_linking_provider.set(None),
+                                                    }
+                                                });
+                                            }
                                         }
                                         class=move || {
                                             let linked = linked_apple.get();
@@ -5603,12 +6417,29 @@ fn HomePage() -> impl IntoView {
                                     </div>
                                     <button
                                         on:click=move |_| {
-                                            set_linking_provider.set(Some("Microsoft".to_string()));
-                                            leptos::task::spawn_local(async move {
-                                                sleep_delay(std::time::Duration::from_millis(1200)).await;
-                                                set_linked_microsoft.update(|v| *v = !*v);
-                                                set_linking_provider.set(None);
-                                            });
+                                            let linked = linked_microsoft.get();
+                                            if linked {
+                                                set_linking_provider.set(Some("Microsoft".to_string()));
+                                                leptos::task::spawn_local(async move {
+                                                    sleep_delay(std::time::Duration::from_millis(1200)).await;
+                                                    let _ = unlink_oauth_provider("Microsoft".to_string()).await;
+                                                    refresh_dashboard();
+                                                    set_linking_provider.set(None);
+                                                });
+                                            } else {
+                                                set_linking_provider.set(Some("Microsoft".to_string()));
+                                                leptos::task::spawn_local(async move {
+                                                    sleep_delay(std::time::Duration::from_millis(1200)).await;
+                                                    match start_oauth_redirect("Microsoft".to_string()).await {
+                                                        Ok(response) => {
+                                                            let _ = &response;
+                                                            #[cfg(feature = "hydrate")]
+                                                            redirect_browser_to_url(&response.auth_url);
+                                                        }
+                                                        Err(_) => set_linking_provider.set(None),
+                                                    }
+                                                });
+                                            }
                                         }
                                         class=move || {
                                             let linked = linked_microsoft.get();
@@ -5637,12 +6468,29 @@ fn HomePage() -> impl IntoView {
                                     </div>
                                     <button
                                         on:click=move |_| {
-                                            set_linking_provider.set(Some("Facebook".to_string()));
-                                            leptos::task::spawn_local(async move {
-                                                sleep_delay(std::time::Duration::from_millis(1200)).await;
-                                                set_linked_facebook.update(|v| *v = !*v);
-                                                set_linking_provider.set(None);
-                                            });
+                                            let linked = linked_facebook.get();
+                                            if linked {
+                                                set_linking_provider.set(Some("Facebook".to_string()));
+                                                leptos::task::spawn_local(async move {
+                                                    sleep_delay(std::time::Duration::from_millis(1200)).await;
+                                                    let _ = unlink_oauth_provider("Facebook".to_string()).await;
+                                                    refresh_dashboard();
+                                                    set_linking_provider.set(None);
+                                                });
+                                            } else {
+                                                set_linking_provider.set(Some("Facebook".to_string()));
+                                                leptos::task::spawn_local(async move {
+                                                    sleep_delay(std::time::Duration::from_millis(1200)).await;
+                                                    match start_oauth_redirect("Facebook".to_string()).await {
+                                                        Ok(response) => {
+                                                            let _ = &response;
+                                                            #[cfg(feature = "hydrate")]
+                                                            redirect_browser_to_url(&response.auth_url);
+                                                        }
+                                                        Err(_) => set_linking_provider.set(None),
+                                                    }
+                                                });
+                                            }
                                         }
                                         class=move || {
                                             let linked = linked_facebook.get();
@@ -5659,7 +6507,7 @@ fn HomePage() -> impl IntoView {
                                 </div>
                             </div>
 
-                            // Simulated Linking overlay spinner
+                            // Linking overlay spinner
                             <Show when=move || linking_provider.get().is_some()>
                                 <div class="fixed inset-0 bg-slate-950/60 backdrop-blur-md flex flex-col gap-4 items-center justify-center z-50 animate-fadeIn">
                                     <div class="w-10 h-10 border-4 border-transparent border-t-[#00d4aa] rounded-full animate-spin"></div>
@@ -5789,7 +6637,8 @@ fn HomePage() -> impl IntoView {
                                             <label class="text-[10px] uppercase font-bold text-slate-400">"Username"</label>
                                             <input
                                                 type="text"
-                                                prop:value=move || dashboard_data.get().user.clone().unwrap_or_default().username
+                                                prop:value=settings_username
+                                                on:input=move |ev| set_settings_username.set(event_target_value(&ev))
                                                 class="w-full mt-1 px-3 py-2 bg-zinc-950 border border-zinc-800 focus:border-[#00d4aa] rounded-lg text-white text-xs outline-none"
                                             />
                                         </div>
@@ -5797,17 +6646,37 @@ fn HomePage() -> impl IntoView {
                                             <label class="text-[10px] uppercase font-bold text-slate-400">"Email Address"</label>
                                             <input
                                                 type="email"
-                                                prop:value=move || dashboard_data.get().user.clone().unwrap_or_default().email
+                                                prop:value=settings_email
+                                                on:input=move |ev| set_settings_email.set(event_target_value(&ev))
                                                 class="w-full mt-1 px-3 py-2 bg-zinc-950 border border-zinc-800 focus:border-[#00d4aa] rounded-lg text-white text-xs outline-none"
                                             />
                                         </div>
 
+                                        <Show when=move || profile_error_message.get().is_some()>
+                                            <div class="p-3 bg-red-950/40 border border-red-900 rounded-lg text-red-400 text-[11px] font-semibold animate-fadeIn">
+                                                {move || profile_error_message.get().unwrap_or_default()}
+                                            </div>
+                                        </Show>
+
                                         <button
                                             on:click=move |_| {
-                                                set_profile_success_toast.set(true);
+                                                let username = settings_username.get();
+                                                let email = settings_email.get();
                                                 leptos::task::spawn_local(async move {
-                                                    sleep_delay(std::time::Duration::from_secs(2)).await;
-                                                    set_profile_success_toast.set(false);
+                                                    match update_user_profile(username, email).await {
+                                                        Ok(_) => {
+                                                            set_profile_error_message.set(None);
+                                                            set_profile_success_toast.set(true);
+                                                            refresh_dashboard();
+                                                            sleep_delay(std::time::Duration::from_secs(2)).await;
+                                                            set_profile_success_toast.set(false);
+                                                        }
+                                                        Err(e) => {
+                                                            let err_msg = e.to_string();
+                                                            let clean_msg = err_msg.replace("ServerFnError: ", "");
+                                                            set_profile_error_message.set(Some(clean_msg));
+                                                        }
+                                                    }
                                                 });
                                             }
                                             class="w-full py-2 bg-[#00d4aa] hover:bg-emerald-500 text-[#0b0f19] text-xs font-bold rounded-lg transition-all"
@@ -5851,6 +6720,199 @@ fn NotFound() -> impl IntoView {
             <a href="/" class="px-6 py-3 bg-[#1e293b] hover:bg-[#334155] rounded-xl border border-[#334155] text-sm text-white transition-all">
                 "Back to Dashboard"
             </a>
+        </div>
+    }
+}
+
+#[component]
+#[allow(unused_variables)]
+pub fn AuthCallback() -> impl IntoView {
+    use leptos_router::hooks::use_params_map;
+
+    let query_map = use_query_map();
+    let params_map = use_params_map();
+
+    let (step, set_step) = signal(0);
+    let (status_text, set_status_text) = signal("Securing backchannel tunnel...".to_string());
+    let (error_msg, set_error_msg) = signal(Option::<String>::None);
+
+    let provider = move || params_map.with(|p| p.get("provider").unwrap_or_default());
+
+    Effect::new(move |_| {
+        #[cfg(feature = "hydrate")]
+        {
+            let provider_str = provider();
+            let query = query_map.get();
+            let code_str = query.get("code").map(|s| s.to_string()).unwrap_or_default();
+            let state_str = query
+                .get("state")
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+
+            if code_str.is_empty() || state_str.is_empty() {
+                set_error_msg.set(Some("Missing required OAuth code or CSRF state parameters. Secure handshake aborted.".to_string()));
+                set_status_text.set("Handshake failed".to_string());
+                return;
+            }
+
+            leptos::task::spawn_local(async move {
+                // Step 1: Verification
+                set_step.set(20);
+                set_status_text.set("Validating secure session state cookie...".to_string());
+                sleep_delay(std::time::Duration::from_millis(600)).await;
+
+                // Step 2: Code exchange
+                set_step.set(45);
+                set_status_text.set(format!(
+                    "Exchanging cryptographic authorization credentials with {}...",
+                    provider_str
+                ));
+                sleep_delay(std::time::Duration::from_millis(600)).await;
+
+                // Step 3: Contacting provider & parsing identity
+                set_step.set(70);
+                set_status_text.set(
+                    "Parsing verified social user profile and mapping metadata...".to_string(),
+                );
+
+                // Call the actual backend server function
+                match oauth_callback(provider_str.clone(), code_str, state_str).await {
+                    Ok(_) => {
+                        set_step.set(100);
+                        set_status_text.set(
+                            "Authentication success! Synchronizing dashboard session..."
+                                .to_string(),
+                        );
+                        sleep_delay(std::time::Duration::from_millis(800)).await;
+                        // Redirect to dashboard
+                        if let Some(window) = web_sys::window() {
+                            let _ = window.location().set_href("/dashboard");
+                        }
+                    }
+                    Err(e) => {
+                        let err_str = match e {
+                            ServerFnError::ServerError(s) => s,
+                            other => other.to_string(),
+                        };
+                        set_error_msg.set(Some(format!("OAuth Integration Error: {}", err_str)));
+                        set_status_text.set("Handshake failed".to_string());
+                    }
+                }
+            });
+        }
+    });
+
+    view! {
+        <div class="min-h-screen bg-[#0b0f19] flex items-center justify-center p-6 relative overflow-hidden">
+            // Abstract background accents
+            <div class="absolute -top-40 -left-40 w-96 h-96 bg-emerald-500/10 rounded-full blur-3xl"></div>
+            <div class="absolute -bottom-40 -right-40 w-96 h-96 bg-indigo-500/10 rounded-full blur-3xl"></div>
+
+            <div class="w-full max-w-lg bg-slate-900/40 backdrop-blur-xl border border-zinc-800/80 shadow-2xl rounded-3xl p-8 md:p-10 text-center relative z-10 space-y-8 animate-fadeIn">
+                <div class="space-y-2">
+                    <div class="text-[10px] font-black uppercase tracking-wider text-[#00d4aa]">"Secure Portal Handshake"</div>
+                    <h1 class="text-2xl font-black text-white">"Identity Integration"</h1>
+                    <p class="text-xs text-slate-400">"Processing secure backchannel OAuth 2.0 validation with " {move || provider()} " server node"</p>
+                </div>
+
+                <Show
+                    when=move || error_msg.get().is_none()
+                    fallback=move || {
+                        view! {
+                            <div class="space-y-6 animate-fadeIn">
+                                // Beautiful error card
+                                <div class="bg-red-950/20 border border-red-900/50 rounded-2xl p-6 text-left space-y-3">
+                                    <div class="flex items-center gap-2.5 text-red-400">
+                                        <svg class="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
+                                            <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                                        </svg>
+                                        <span class="text-sm font-bold">"Verification Interrupted"</span>
+                                    </div>
+                                    <p class="text-xs text-slate-300 leading-relaxed">
+                                        {move || error_msg.get().unwrap_or_default()}
+                                    </p>
+                                </div>
+
+                                <div class="flex flex-col sm:flex-row gap-3">
+                                    <a href="/settings" class="flex-1 py-3 bg-[#111827] hover:bg-zinc-900 border border-zinc-800 rounded-xl text-xs font-bold text-slate-300 transition-all">
+                                        "Back to Settings"
+                                    </a>
+                                    <a href="/dashboard" class="flex-1 py-3 bg-[#00d4aa] hover:bg-emerald-500 text-[#0b0f19] rounded-xl text-xs font-bold transition-all">
+                                        "Secure Dashboard"
+                                    </a>
+                                </div>
+                            </div>
+                        }
+                    }
+                >
+                    <div class="space-y-8">
+                        // Circle loader or progress circle
+                        <div class="relative w-28 h-28 mx-auto flex items-center justify-center">
+                            // Glowing halo
+                            <div class="absolute inset-0 rounded-full bg-emerald-500/5 blur-md"></div>
+
+                            // SVG circular loader
+                            <svg class="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
+                                <circle
+                                    class="text-zinc-800"
+                                    stroke-width="6"
+                                    stroke="currentColor"
+                                    fill="transparent"
+                                    r="38"
+                                    cx="50"
+                                    cy="50"
+                                />
+                                <circle
+                                    class="text-[#00d4aa] transition-all duration-300 ease-out"
+                                    stroke-width="6"
+                                    stroke-dasharray="238.76"
+                                    stroke-dashoffset=move || {
+                                        let current_step = step.get() as f32;
+                                        238.76 * (1.0 - current_step / 100.0)
+                                    }
+                                    stroke-linecap="round"
+                                    stroke="currentColor"
+                                    fill="transparent"
+                                    r="38"
+                                    cx="50"
+                                    cy="50"
+                                />
+                            </svg>
+                            // Inner text showing status percentage
+                            <div class="absolute text-xl font-black text-white">
+                                {move || format!("{}%", step.get())}
+                            </div>
+                        </div>
+
+                        // Modern sliding step tracker & line indicator
+                        <div class="space-y-3">
+                            <div class="h-1.5 w-full bg-zinc-900 rounded-full overflow-hidden">
+                                <div
+                                    class="h-full bg-gradient-to-r from-emerald-500 to-[#00d4aa] transition-all duration-300"
+                                    style=move || format!("width: {}%", step.get())
+                                ></div>
+                            </div>
+                            <div class="flex justify-between items-center text-[10px] uppercase font-bold text-slate-500">
+                                <span>"Handshake"</span>
+                                <span>"Verified Session"</span>
+                            </div>
+                        </div>
+
+                        // Status notification message
+                        <div class="bg-[#111827]/40 border border-zinc-800/40 rounded-2xl p-4 flex items-center justify-center gap-3">
+                            <div class="w-2.5 h-2.5 bg-emerald-500 rounded-full animate-ping shrink-0"></div>
+                            <p class="text-xs text-slate-300 font-medium">
+                                {move || status_text.get()}
+                            </p>
+                        </div>
+                    </div>
+                </Show>
+
+                // Footer branding
+                <div class="text-[10px] text-slate-500">
+                    "Royal Flush 2.0 Secure OIDC Cryptographic Protocol Node"
+                </div>
+            </div>
         </div>
     }
 }

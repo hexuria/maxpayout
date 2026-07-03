@@ -14,10 +14,10 @@ The workspace consists of the following 4 individual crates:
 
 | Crate | Purpose | Location |
 | :--- | :--- | :--- |
-| **[`flushline`](file:///Users/uriah/Code/maxpayout/flushline)** | 5-tier card progression engine (Ten -> Jack -> Queen -> King -> Ace). | `./flushline` |
-| **[`matrix`](file:///Users/uriah/Code/maxpayout/matrix)** | 2x3 forced-matrix referral tree (7-slot) cycling engine. | `./matrix` |
-| **[`sponsor_allocator`](file:///Users/uriah/Code/maxpayout/sponsor_allocator)** | Sponsor pool management and allocation strategies. | `./sponsor_allocator` |
-| **[`potbonus`](file:///Users/uriah/Code/maxpayout/potbonus)** | Weekly 75-25 pot bonus orchestrator with dual qualification and user-level aggregation. | `./potbonus` |
+| **[`flushline`](./flushline)** | 5-tier card progression engine (Ten -> Jack -> Queen -> King -> Ace). | `./flushline` |
+| **[`matrix`](./matrix)** | 2x3 forced-matrix referral tree (7-slot) cycling engine. | `./matrix` |
+| **[`sponsor_allocator`](./sponsor_allocator)** | Sponsor pool management and allocation strategies. | `./sponsor_allocator` |
+| **[`potbonus`](./potbonus)** | Weekly 75-25 pot bonus orchestrator with dual qualification and user-level aggregation. | `./potbonus` |
 
 ---
 

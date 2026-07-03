@@ -4,11 +4,12 @@ use leptos_wasi::prelude::Handler;
 use wasip3::http::types::{ErrorCode, Request, Response};
 
 use crate::app::{
-    App, AwardPoints, CheckLocalTestingEnabled, CheckMagicLinkEnabled, GetActiveSessions,
-    GetUserDashboardStatus, LoginPasskeyFinish, LoginPasskeyStart, LoginViaMagicLink,
-    LoginWithPassword, Logout, RegisterPasskeyFinish, RegisterPasskeyFinishSignup,
-    RegisterPasskeyStart, RegisterWithPassword, RequestMagicLink, RevokeOtherSessions,
-    RevokeSession, SetReferralCookieSsr, shell, GetMatrixForAccount, CreateDownlineAccount,
+    App, AwardPoints, CheckLocalTestingEnabled, CheckMagicLinkEnabled, CreateDownlineAccount,
+    GetActiveSessions, GetMatrixForAccount, GetUserDashboardStatus, LoginPasskeyFinish,
+    LoginPasskeyStart, LoginViaMagicLink, LoginWithPassword, Logout, OauthCallback,
+    RegisterPasskeyFinish, RegisterPasskeyFinishSignup, RegisterPasskeyStart, RegisterWithPassword,
+    RequestMagicLink, RevokeOtherSessions, RevokeSession, SetReferralCookieSsr, StartOauthRedirect,
+    UnlinkOauthProvider, UpdateUserProfile, shell,
 };
 
 struct LeptosServer;
@@ -52,6 +53,10 @@ impl wasip3::exports::http::handler::Guest for LeptosServer {
             .with_server_fn::<CheckMagicLinkEnabled>()
             .with_server_fn::<GetMatrixForAccount>()
             .with_server_fn::<CreateDownlineAccount>()
+            .with_server_fn::<StartOauthRedirect>()
+            .with_server_fn::<OauthCallback>()
+            .with_server_fn::<UnlinkOauthProvider>()
+            .with_server_fn::<UpdateUserProfile>()
             .generate_routes(App)
             .handle_with_context(move || shell(leptos_options.clone()), || {})
             .await

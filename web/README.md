@@ -39,3 +39,11 @@ Once running, access the application at `http://127.0.0.1:4000`.
    - **Wasmtime:** Persists the count to `/data/counter.txt` inside the component's sandboxed filesystem, mapped via `--dir=./data::/data` to a local directory on your host.
 2. **Static Files:** `./target/site/pkg/` is mapped by Wasmtime to `/` inside the guest for static file serving.
 3. **WASI HTTP:** The server implements `wasip3::exports::http::handler::Guest` and runs as a native WebAssembly component using the Preview 3 async ABI.
+
+---
+
+## OAuth 2.0 Integration & Environment Setup
+
+This project features standard OAuth 2.0 social sign-in integration with **Google, Apple, Microsoft, and Facebook**, running fully in-guest inside the sandboxed WebAssembly execution layer.
+
+For developer portal registration guidelines, required scopes, environment variable keys, and local sandbox configuration details, see [docs/oauth_setup.md](../docs/oauth_setup.md).
