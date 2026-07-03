@@ -3,7 +3,7 @@
 # List of crates in the workspace
 CRATES := flushline matrix sponsor_allocator potbonus coordinator api
 
-.PHONY: all check clippy fmt test fake-oauth check-fake-oauth help $(CRATES)
+.PHONY: all check clippy fmt test clean fake-oauth check-fake-oauth help $(CRATES)
 
 # Default action runs everything on all crates
 all: fmt check clippy test
@@ -79,6 +79,11 @@ test:
 		fi; \
 	done
 
+clean:
+	@echo "Removing all nested target directories..."
+	@find . -type d -name target -prune -exec rm -rf {} +
+	@echo "Clean complete."
+
 fake-oauth:
 	@cd tools/fake-oauth-provider && cargo run -- --host 127.0.0.1 --port 9001
 
@@ -97,6 +102,7 @@ help:
 	@echo "  check   - Compile and verify compilation for native, browser WASM, and WASI targets"
 	@echo "  clippy  - Run cargo clippy (fails on warnings)"
 	@echo "  test    - Run all unit and integration tests"
+	@echo "  clean   - Remove all nested target directories"
 	@echo "  fake-oauth - Run the local fake OAuth/OIDC provider on 127.0.0.1:9001"
 	@echo "  check-fake-oauth - Compile the local fake OAuth/OIDC provider"
 	@echo "  all     - Run fmt, check, clippy, and test on target(s)"
