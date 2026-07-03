@@ -240,31 +240,39 @@ async fn test_api_full_flow() {
         .unwrap();
 
     // Give background worker time to pick up and execute the dual graduation + cycle
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut success = false;
+    let mut coord_status = serde_json::Value::Null;
+    for _ in 0..50 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&status_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if response.status() == StatusCode::OK {
+            let res_body_str = get_response_body(response.into_body()).await;
+            if let Ok(final_status_json) = serde_json::from_str::<Value>(&res_body_str) {
+                if let Some(coord) = final_status_json.get("coordination_state") {
+                    coord_status = coord.clone();
+                    if coord.get("new_account_spawned").and_then(|v| v.as_bool()) == Some(true) {
+                        success = true;
+                        break;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
-    // 7. Verify Coordination result via status check
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(&status_uri)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let res_body_str = get_response_body(response.into_body()).await;
-    let final_status_json: Value = serde_json::from_str(&res_body_str).unwrap();
-    let coord_status = final_status_json.get("coordination_state").unwrap();
-
-    // Coordination should show that a new free account was spawned
-    assert!(coord_status
-        .get("new_account_spawned")
-        .unwrap()
-        .as_bool()
-        .unwrap());
+    assert!(
+        success,
+        "Coordination state did not spawn a new account in time. State: {:?}",
+        coord_status
+    );
 
     // Verify free account details exist in database
     let free_account_id_str: String = sqlx::query_scalar(

@@ -378,28 +378,36 @@ async fn test_polling_outbox_worker_daemon() {
         50, // Poll every 50ms for tests
     ));
 
-    // Wait a short time for polling to occur
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Wait and check periodically for up to 5 seconds for processing to occur
+    let mut success = false;
+    for _ in 0..100 {
+        let m_processed: bool =
+            sqlx::query_scalar("SELECT processed FROM matrix_outbox WHERE event_id = $1")
+                .bind(m_event_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let f_processed: bool =
+            sqlx::query_scalar("SELECT processed FROM flushline_outbox WHERE event_id = $1")
+                .bind(f_event_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        if m_processed && f_processed {
+            success = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     // Terminate daemon background task
     daemon_handle.abort();
+    let _ = daemon_handle.await;
 
-    // 3. Assert outboxes are now marked processed
-    let m_processed: bool =
-        sqlx::query_scalar("SELECT processed FROM matrix_outbox WHERE event_id = $1")
-            .bind(m_event_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert!(m_processed);
-
-    let f_processed: bool =
-        sqlx::query_scalar("SELECT processed FROM flushline_outbox WHERE event_id = $1")
-            .bind(f_event_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert!(f_processed);
+    assert!(
+        success,
+        "Outbox events were not processed by the daemon within the timeout"
+    );
 
     // 4. Assert coordination states show BOTH were fully processed
     let state_row = sqlx::query("SELECT is_flushline_graduated, is_matrix_cycled FROM orchestrator_coordination_states WHERE account_id = $1")
